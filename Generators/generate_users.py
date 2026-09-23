@@ -13,13 +13,7 @@ USERS_COUNT = 150
 random.seed(SEED)
 
 
-DB_CONFIG = {
-    "dbname": "DataBase",
-    "user": "postgres",
-    "password": "12345",
-    "host": "localhost",
-    "port": 12345,
-}
+from db_config import DB_CONFIG
 
 
 # ============================================================

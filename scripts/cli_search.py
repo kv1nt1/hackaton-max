@@ -1,5 +1,5 @@
-from database import get_places
-from filters import filter_places
+from app.db import get_places
+from app.core.filters import filter_places
 
 
 def get_list_from_input(text):
