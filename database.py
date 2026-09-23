@@ -47,7 +47,10 @@ def get_places():
                     noise_level,
                     rating,
                     reviews_count,
-                    booking_required
+                    booking_required,
+                    avg_duration_minutes,
+                    edge_id,
+                    edge_position
                 FROM places
                 WHERE active = TRUE
                 ORDER BY id;
@@ -62,3 +65,45 @@ def get_places():
 
     finally:
         connection.close()
+
+def get_city_rows():
+    """Узлы и рёбра графа города для routing.CityGraph."""
+    connection = get_connection()
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id, x, y, district FROM city_nodes;")
+            nodes = [
+                dict(zip(("id", "x", "y", "district"), row))
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute("""
+                SELECT id, node_from, node_to, length_m,
+                       car_speed_kmh, walk_speed_kmh,
+                       car_allowed, walk_allowed
+                FROM city_edges;
+            """)
+            columns = [d[0] for d in cursor.description]
+            edges = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        return nodes, edges
+
+    finally:
+        connection.close()
+
+
+_graph = None
+
+
+def get_city_graph():
+    """Граф строится один раз и переиспользуется (город не меняется)."""
+    global _graph
+
+    if _graph is None:
+        from routing import CityGraph
+
+        nodes, edges = get_city_rows()
+        _graph = CityGraph(nodes, edges)
+
+    return _graph

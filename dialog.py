@@ -1,10 +1,9 @@
 """
-Диалоговая машина состояний для бота (с кнопками).
+Диалог сбора требований встречи (с кнопками).
 
-Последовательность вопросов та же, что в CLI-версии main.py:
-budget -> group_size -> interests -> excluded_categories -> indoor ->
+Вопросы: budget -> interests -> excluded_categories -> indoor ->
 food -> noise. Каждый шаг показывается с inline-кнопками; ввод текстом
-тоже работает (для бюджета и размера группы можно написать своё число).
+тоже работает (для бюджета можно написать своё число).
 
 Состояние хранится в памяти процесса по user_id.
 
@@ -17,7 +16,6 @@ food -> noise. Каждый шаг показывается с inline-кнопк
 """
 
 STEP_BUDGET = "budget"
-STEP_GROUP_SIZE = "group_size"
 STEP_INTERESTS = "interests"
 STEP_EXCLUDED = "excluded_categories"
 STEP_INDOOR = "indoor"
@@ -27,7 +25,6 @@ STEP_DONE = "done"
 
 _STEP_ORDER = [
     STEP_BUDGET,
-    STEP_GROUP_SIZE,
     STEP_INTERESTS,
     STEP_EXCLUDED,
     STEP_INDOOR,
@@ -37,7 +34,6 @@ _STEP_ORDER = [
 
 _STEP_TITLES = {
     STEP_BUDGET: "Бюджет",
-    STEP_GROUP_SIZE: "Компания",
     STEP_INTERESTS: "Интересы",
     STEP_EXCLUDED: "Исключить",
     STEP_INDOOR: "Где",
@@ -49,10 +45,6 @@ _PROMPTS = {
     STEP_BUDGET: (
         "💰 Максимальный бюджет на человека?\n"
         "Выбери кнопкой или напиши своё число в рублях."
-    ),
-    STEP_GROUP_SIZE: (
-        "👥 Сколько человек в компании?\n"
-        "Выбери кнопкой или напиши число."
     ),
     STEP_INTERESTS: (
         "🎯 Что вам интересно? Отметь один или несколько вариантов "
@@ -70,7 +62,6 @@ _PROMPTS = {
 UNLIMITED_BUDGET = 1_000_000
 
 BUDGET_OPTIONS = [500, 1000, 1500, 2000, 3000, 5000]
-GROUP_OPTIONS = [2, 3, 4, 5, 6, 8, 10]
 
 # код интереса в БД -> (эмодзи, название)
 INTERESTS = {
@@ -136,7 +127,6 @@ NOISE_OPTIONS = [
 
 _REQUIREMENT_KEYS = {
     STEP_BUDGET: "budget_max",
-    STEP_GROUP_SIZE: "group_size",
     STEP_INTERESTS: "required_interests",
     STEP_EXCLUDED: "excluded_categories",
     STEP_INDOOR: "indoor",
@@ -269,10 +259,6 @@ class DialogSession:
             rows += _chunk(btns, 3)
             rows.append([_button("♾ Без ограничений", f"{step}:pick:{UNLIMITED_BUDGET}")])
 
-        elif step == STEP_GROUP_SIZE:
-            btns = [_button(str(v), f"{step}:pick:{v}") for v in GROUP_OPTIONS]
-            rows += _chunk(btns, 4)
-
         elif step in _MULTI_CATALOGS:
             catalog = _MULTI_CATALOGS[step]
             chosen = self.selected[step]
@@ -356,14 +342,6 @@ class DialogSession:
             self._advance(step, amount, label)
             return True
 
-        if step == STEP_GROUP_SIZE:
-            try:
-                size = int(value)
-            except ValueError:
-                return False
-            self._advance(step, size, f"{size} чел.")
-            return True
-
         options = {
             STEP_INDOOR: INDOOR_OPTIONS,
             STEP_FOOD: FOOD_OPTIONS,
@@ -398,15 +376,6 @@ class DialogSession:
             except ValueError:
                 return False, "Выбери кнопку или напиши бюджет целым числом, например 1500."
             self._advance(step, value, f"до {value} ₽")
-
-        elif step == STEP_GROUP_SIZE:
-            try:
-                value = int(text)
-                if value <= 0:
-                    raise ValueError
-            except ValueError:
-                return False, "Выбери кнопку или напиши количество человек числом больше нуля."
-            self._advance(step, value, f"{value} чел.")
 
         elif step in _MULTI_CATALOGS:
             codes = _parse_codes(text, _MULTI_CATALOGS[step])
