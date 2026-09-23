@@ -1,19 +1,24 @@
 """
 Диалог сбора требований встречи (с кнопками).
 
-Вопросы: budget -> interests -> excluded_categories -> indoor ->
-food -> noise. Каждый шаг показывается с inline-кнопками; ввод текстом
-тоже работает (для бюджета можно написать своё число).
+Вопросы: budget -> interests -> excluded_categories -> indoor -> food -> noise.
 
-Состояние хранится в памяти процесса по user_id.
+Два режима:
+  * создание встречи — вопросы идут по порядку, есть «⬅️ Назад»;
+  * редактирование готовой встречи — DialogSession(requirements): бот
+    показывает меню со всеми пунктами и текущими значениями, можно
+    поменять любой один пункт и вернуться, не создавая встречу заново.
 
 Формат payload кнопок:
     "<шаг>:<действие>:<значение>"   pick / toggle / done
-    "back:<шаг>"                    вернуться на шаг назад
+    "back:<шаг>"                    назад (в режиме правки пункта — отмена)
+    "menu:edit:<шаг>"               меню: изменить пункт
+    "menu:done:" / "menu:cancel:"   меню: сохранить / отменить изменения
     "restart"                       начать заново
-Шаг внутри payload нужен, чтобы игнорировать нажатия на устаревшие
-кнопки из старых сообщений.
+Шаг внутри payload нужен, чтобы игнорировать старые кнопки.
 """
+
+from dictionaries import CATEGORIES, INTERESTS, category_name, interest_name
 
 STEP_BUDGET = "budget"
 STEP_INTERESTS = "interests"
@@ -41,6 +46,15 @@ _STEP_TITLES = {
     STEP_NOISE: "Шум",
 }
 
+_STEP_ICONS = {
+    STEP_BUDGET: "💰",
+    STEP_INTERESTS: "🎯",
+    STEP_EXCLUDED: "🚫",
+    STEP_INDOOR: "🏠",
+    STEP_FOOD: "🍽",
+    STEP_NOISE: "🔊",
+}
+
 _PROMPTS = {
     STEP_BUDGET: (
         "💰 Максимальный бюджет на человека?\n"
@@ -60,53 +74,7 @@ _PROMPTS = {
 }
 
 UNLIMITED_BUDGET = 1_000_000
-
 BUDGET_OPTIONS = [500, 1000, 1500, 2000, 3000, 5000]
-
-# код интереса в БД -> (эмодзи, название)
-INTERESTS = {
-    "food": ("🍽", "Еда"),
-    "coffee": ("☕", "Кофе"),
-    "desserts": ("🍰", "Десерты"),
-    "drinks": ("🍹", "Напитки"),
-    "conversation": ("💬", "Поговорить"),
-    "social": ("👥", "Большой компанией"),
-    "relax": ("😌", "Расслабиться"),
-    "movies": ("🎬", "Кино"),
-    "culture": ("🎭", "Культура"),
-    "art": ("🎨", "Искусство"),
-    "learning": ("📚", "Узнать новое"),
-    "creative": ("✨", "Творчество"),
-    "games": ("🎲", "Игры"),
-    "gaming": ("🕹", "Аркады"),
-    "board_games": ("♟", "Настолки"),
-    "competitive": ("🏆", "Соревнования"),
-    "active": ("🏃", "Активный отдых"),
-    "adrenaline": ("⚡", "Адреналин"),
-    "music": ("🎤", "Музыка"),
-    "nightlife": ("🌙", "Ночная жизнь"),
-    "outdoor": ("🌳", "На улице"),
-    "nature": ("🌿", "Природа"),
-    "walking": ("🚶", "Прогулка"),
-}
-
-# код категории в БД -> (эмодзи, название)
-CATEGORIES = {
-    "restaurant": ("🍽", "Ресторан"),
-    "cafe": ("☕", "Кафе"),
-    "bar": ("🍸", "Бар"),
-    "cinema": ("🎬", "Кино"),
-    "bowling": ("🎳", "Боулинг"),
-    "karaoke": ("🎤", "Караоке"),
-    "board_game_club": ("♟", "Настолки"),
-    "escape_room": ("🔐", "Квест"),
-    "museum": ("🏛", "Музей"),
-    "gallery": ("🖼", "Галерея"),
-    "karting": ("🏎", "Картинг"),
-    "billiards": ("🎱", "Бильярд"),
-    "arcade": ("🕹", "Аркады"),
-    "park_activity": ("🌳", "Парк"),
-}
 
 INDOOR_OPTIONS = [
     ("in", "🏠 В помещении", True),
@@ -125,6 +93,12 @@ NOISE_OPTIONS = [
     ("any", "🔊 Не важно", None),
 ]
 
+_OPTIONS = {
+    STEP_INDOOR: INDOOR_OPTIONS,
+    STEP_FOOD: FOOD_OPTIONS,
+    STEP_NOISE: NOISE_OPTIONS,
+}
+
 _REQUIREMENT_KEYS = {
     STEP_BUDGET: "budget_max",
     STEP_INTERESTS: "required_interests",
@@ -139,8 +113,48 @@ _MULTI_CATALOGS = {
     STEP_EXCLUDED: CATEGORIES,
 }
 
+_MULTI_NAME = {
+    STEP_INTERESTS: interest_name,
+    STEP_EXCLUDED: category_name,
+}
 
-# ---------------------------------------------------------------- парсинг текста
+
+# ---------------------------------------------------------------- текст
+
+def describe(step, value):
+    """Значение требования словами для сводки."""
+    if step == STEP_BUDGET:
+        if value is None:
+            return "не задан"
+        return "без ограничений" if value >= UNLIMITED_BUDGET else f"до {value} ₽"
+
+    if step in _MULTI_NAME:
+        names = ", ".join(_MULTI_NAME[step](c) for c in (value or []))
+        if names:
+            return names
+        return "любые" if step == STEP_INTERESTS else "нет ограничений"
+
+    if step == STEP_INDOOR:
+        return {True: "в помещении", False: "на улице"}.get(value, "не важно")
+
+    if step == STEP_FOOD:
+        return "нужна" if value else "не обязательна"
+
+    if step == STEP_NOISE:
+        return {"quiet": "только тихо", "medium": "умеренно"}.get(value, "не важно")
+
+    return str(value)
+
+
+def requirement_lines(requirements):
+    """Строки «Название: значение» для карточки встречи."""
+    return [
+        f"{_STEP_ICONS[s]} {_STEP_TITLES[s]}: "
+        f"{describe(s, requirements.get(_REQUIREMENT_KEYS[s]))}"
+        for s in _STEP_ORDER
+        if _REQUIREMENT_KEYS[s] in requirements
+    ]
+
 
 def _parse_codes(text, catalog):
     """Принимает коды или русские названия через запятую -> список кодов."""
@@ -171,14 +185,10 @@ def _parse_indoor(text):
     return None
 
 
-def _parse_yes_no(text):
-    return text.strip().lower() in ("да", "yes", "y", "нужна")
-
-
 def _parse_noise(text):
     t = text.strip().lower()
     return {"quiet": "quiet", "тихо": "quiet", "medium": "medium",
-            "умеренно": "medium", "loud": None}.get(t)
+            "умеренно": "medium"}.get(t)
 
 
 def _button(text, payload, intent="default"):
@@ -192,32 +202,62 @@ def _chunk(buttons, size):
 # ---------------------------------------------------------------- сессия
 
 class DialogSession:
-    """Состояние одного диалога сбора требований."""
+    """Состояние диалога требований (создание или редактирование)."""
 
-    def __init__(self):
+    def __init__(self, requirements=None, meeting_code=None):
         self.step_index = 0
         self.requirements = {}
-        self.answers = {}  # шаг -> текст ответа для «Твои ответы»
+        self.answers = {}
         self.selected = {STEP_INTERESTS: [], STEP_EXCLUDED: []}
+        self.meeting_code = meeting_code   # не None — правим готовую встречу
+        self.menu = False                  # режим меню редактирования
+        self.editing = None                # какой пункт правим сейчас
+
+        if requirements is not None:
+            self._load(requirements)
+
+    def _load(self, requirements):
+        self.requirements = dict(requirements)
+
+        for step in _STEP_ORDER:
+            key = _REQUIREMENT_KEYS[step]
+            if key in self.requirements:
+                self.answers[step] = describe(step, self.requirements[key])
+                if step in self.selected:
+                    self.selected[step] = list(self.requirements[key] or [])
+
+        self.step_index = len(_STEP_ORDER)
+        self.menu = True
 
     # ---- состояние
 
     @property
     def current_step(self):
+        if self.editing:
+            return self.editing
         if self.step_index >= len(_STEP_ORDER):
             return STEP_DONE
         return _STEP_ORDER[self.step_index]
 
     def is_done(self):
-        return self.current_step == STEP_DONE
+        """Все вопросы созданной встречи пройдены (меню редактирования — нет)."""
+        return (
+            not self.menu
+            and not self.editing
+            and self.step_index >= len(_STEP_ORDER)
+        )
 
-    def _advance(self, step, requirement_value, answer_text):
-        self.requirements[_REQUIREMENT_KEYS[step]] = requirement_value
-        self.answers[step] = answer_text
-        self.step_index += 1
+    def _advance(self, step, value):
+        self.requirements[_REQUIREMENT_KEYS[step]] = value
+        self.answers[step] = describe(step, value)
+
+        if self.editing:
+            self.editing = None      # после правки пункта — назад в меню
+        else:
+            self.step_index += 1
 
     def go_back(self):
-        if self.step_index == 0:
+        if self.menu or self.step_index == 0:
             return False
         self.step_index -= 1
         step = _STEP_ORDER[self.step_index]
@@ -225,31 +265,57 @@ class DialogSession:
         self.answers.pop(step, None)
         return True
 
-    # ---- вывод шага
+    # ---- вывод
 
     def summary_lines(self):
-        lines = []
-        for step in _STEP_ORDER:
-            if step in self.answers:
-                lines.append(f"• {_STEP_TITLES[step]}: {self.answers[step]}")
-        return lines
-
-    def render(self):
-        """(текст, строки кнопок) для текущего шага."""
-        step = self.current_step
-        parts = []
-
-        summary = self.summary_lines()
-        if summary:
-            parts.append("Твои ответы:\n" + "\n".join(summary))
-
-        parts.append(
-            f"Шаг {self.step_index + 1} из {len(_STEP_ORDER)}\n{_PROMPTS[step]}"
-        )
-        return "\n\n".join(parts), self._keyboard(step)
+        return [
+            f"• {_STEP_TITLES[s]}: {self.answers[s]}"
+            for s in _STEP_ORDER
+            if s in self.answers
+        ]
 
     def summary_text(self):
         return "Твои ответы:\n" + "\n".join(self.summary_lines())
+
+    def render(self):
+        """(текст, строки кнопок) для текущего состояния."""
+        if self.menu and not self.editing:
+            return self._render_menu()
+
+        step = self.current_step
+        parts = []
+
+        if self.editing:
+            parts.append(f"Изменяем: {_STEP_TITLES[step]}")
+            parts.append(_PROMPTS[step])
+        else:
+            summary = self.summary_lines()
+            if summary:
+                parts.append("Твои ответы:\n" + "\n".join(summary))
+            parts.append(
+                f"Шаг {self.step_index + 1} из {len(_STEP_ORDER)}\n{_PROMPTS[step]}"
+            )
+
+        return "\n\n".join(parts), self._keyboard(step)
+
+    def _render_menu(self):
+        text = (
+            "⚙️ Требования встречи\n"
+            "Нажми на пункт, чтобы изменить. Когда закончишь — «Сохранить»."
+        )
+        rows = []
+
+        for step in _STEP_ORDER:
+            label = f"{_STEP_ICONS[step]} {_STEP_TITLES[step]}: {self.answers.get(step, '—')}"
+            if len(label) > 60:
+                label = label[:57] + "…"
+            rows.append([_button(label, f"menu:edit:{step}")])
+
+        rows.append([
+            _button("✅ Сохранить", "menu:done:", "positive"),
+            _button("✖️ Отмена", "menu:cancel:"),
+        ])
+        return text, rows
 
     def _keyboard(self, step):
         rows = []
@@ -273,16 +339,12 @@ class DialogSession:
             else:
                 rows.append([_button("Пропустить ➡️", f"{step}:done:")])
 
-        elif step == STEP_INDOOR:
-            rows.append([_button(t, f"{step}:pick:{k}") for k, t, _ in INDOOR_OPTIONS])
+        elif step in _OPTIONS:
+            rows.append([_button(t, f"{step}:pick:{k}") for k, t, _ in _OPTIONS[step]])
 
-        elif step == STEP_FOOD:
-            rows.append([_button(t, f"{step}:pick:{k}") for k, t, _ in FOOD_OPTIONS])
-
-        elif step == STEP_NOISE:
-            rows.append([_button(t, f"{step}:pick:{k}") for k, t, _ in NOISE_OPTIONS])
-
-        if self.step_index > 0:
+        if self.editing:
+            rows.append([_button("⬅️ Отмена", f"back:{step}")])
+        elif self.step_index > 0:
             rows.append([_button("⬅️ Назад", f"back:{step}")])
 
         return rows
@@ -291,15 +353,21 @@ class DialogSession:
 
     def press(self, payload):
         """
-        Обрабатывает нажатие кнопки.
-        Возвращает: "stale" (кнопка устарела), "redraw" (перерисовать
-        текущий шаг) или "done" (все ответы собраны).
+        Возвращает: "stale" — кнопка устарела; "redraw" — перерисовать;
+        "done" — все вопросы созданной встречи пройдены;
+        "menu_done" / "cancel" — выход из меню редактирования.
         """
         parts = (payload or "").split(":", 2)
+
+        if parts[0] == "menu":
+            return self._press_menu(parts)
 
         if parts[0] == "back":
             if len(parts) < 2 or parts[1] != self.current_step:
                 return "stale"
+            if self.editing:
+                self.editing = None
+                return "redraw"
             return "redraw" if self.go_back() else "stale"
 
         if len(parts) < 3 or parts[0] != self.current_step:
@@ -318,10 +386,7 @@ class DialogSession:
             return "redraw"
 
         if action == "done" and step in _MULTI_CATALOGS:
-            catalog = _MULTI_CATALOGS[step]
-            chosen = list(self.selected[step])
-            names = ", ".join(catalog[c][1] for c in chosen) or "неважно"
-            self._advance(step, chosen, names)
+            self._advance(step, list(self.selected[step]))
 
         elif action == "pick":
             if not self._apply_pick(step, value):
@@ -332,29 +397,34 @@ class DialogSession:
 
         return "done" if self.is_done() else "redraw"
 
+    def _press_menu(self, parts):
+        if not self.menu or self.editing or len(parts) < 2:
+            return "stale"
+
+        action = parts[1]
+
+        if action == "edit" and len(parts) == 3 and parts[2] in _STEP_ORDER:
+            self.editing = parts[2]
+            return "redraw"
+        if action == "done":
+            return "menu_done"
+        if action == "cancel":
+            return "cancel"
+
+        return "stale"
+
     def _apply_pick(self, step, value):
         if step == STEP_BUDGET:
             try:
                 amount = int(value)
             except ValueError:
                 return False
-            label = "без ограничений" if amount >= UNLIMITED_BUDGET else f"до {amount} ₽"
-            self._advance(step, amount, label)
+            self._advance(step, amount)
             return True
 
-        options = {
-            STEP_INDOOR: INDOOR_OPTIONS,
-            STEP_FOOD: FOOD_OPTIONS,
-            STEP_NOISE: NOISE_OPTIONS,
-        }.get(step)
-
-        if options is None:
-            return False
-
-        for key, label, req_value in options:
+        for key, _label, req_value in _OPTIONS.get(step, ()):
             if key == value:
-                # у label убираем эмодзи в начале для сводки
-                self._advance(step, req_value, label.split(" ", 1)[1])
+                self._advance(step, req_value)
                 return True
 
         return False
@@ -362,9 +432,10 @@ class DialogSession:
     # ---- ввод текстом (запасной вариант)
 
     def submit(self, text):
-        """
-        Ответ текстом на текущий шаг. Возвращает (ok, error_message).
-        """
+        """Ответ текстом на текущий шаг. Возвращает (ok, error_message)."""
+        if self.menu and not self.editing:
+            return False, "Выбери пункт кнопкой под сообщением."
+
         step = self.current_step
         text = text.strip()
 
@@ -375,41 +446,20 @@ class DialogSession:
                     raise ValueError
             except ValueError:
                 return False, "Выбери кнопку или напиши бюджет целым числом, например 1500."
-            self._advance(step, value, f"до {value} ₽")
+            self._advance(step, value)
 
         elif step in _MULTI_CATALOGS:
             codes = _parse_codes(text, _MULTI_CATALOGS[step])
-            catalog = _MULTI_CATALOGS[step]
             self.selected[step] = codes
-            names = ", ".join(catalog[c][1] if c in catalog else c for c in codes)
-            self._advance(step, codes, names or "неважно")
+            self._advance(step, codes)
 
         elif step == STEP_INDOOR:
-            value = _parse_indoor(text)
-            names = {True: "в помещении", False: "на улице", None: "не важно"}
-            self._advance(step, value, names[value])
+            self._advance(step, _parse_indoor(text))
 
         elif step == STEP_FOOD:
-            value = _parse_yes_no(text)
-            self._advance(step, value, "нужна" if value else "не обязательна")
+            self._advance(step, text.lower() in ("да", "yes", "y", "нужна"))
 
         elif step == STEP_NOISE:
-            value = _parse_noise(text)
-            names = {"quiet": "только тихо", "medium": "умеренно", None: "не важно"}
-            self._advance(step, value, names[value])
-
-        else:
-            return True, None
+            self._advance(step, _parse_noise(text))
 
         return True, None
-
-
-def format_place(place):
-    return (
-        f"[{place['id']}] {place['name']}\n"
-        f"  Категория: {place['category']}\n"
-        f"  Район: {place['district']}\n"
-        f"  Цена: {place['price_min']}–{place['price_max']}\n"
-        f"  Рейтинг: {place['rating']}\n"
-        f"  Интересы: {', '.join(place['interests'] or [])}"
-    )

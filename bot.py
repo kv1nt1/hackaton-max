@@ -26,7 +26,13 @@ import re
 import time
 
 from database import get_city_graph, get_places
-from dialog import DialogSession
+from dialog import DialogSession, requirement_lines
+from dictionaries import (
+    category_name,
+    district_name,
+    interest_names,
+    noise_name,
+)
 from max_client import MaxApiError, MaxClient
 from meetings import MAX_PARTICIPANTS, MeetingStore, Participant
 from participant import DISTRICT_NAMES, TRANSPORT_ICONS, ProfileSession
@@ -216,6 +222,10 @@ class Bot:
             self.edit_or_send(callback_id, user_id, text, keyboard)
         elif status == "done":
             self.finish_dialog(user_id, session, callback_id)
+        elif status == "menu_done":
+            self.finish_requirements_edit(user_id, session, callback_id)
+        elif status == "cancel":
+            self.cancel_requirements_edit(user_id, session, callback_id)
 
     def handle_profile_callback(self, user_id, callback_id, payload):
         session = self.profiles.get(user_id)
@@ -269,6 +279,15 @@ class Bot:
                              attachments=[self.client.inline_keyboard(
                                  self.card_keyboard(meeting, user_id))])
 
+        elif action == "reqs":
+            if user_id != meeting.organizer_id:
+                self.answer_safe(callback_id, notification="Менять требования может только организатор")
+                return
+            session = DialogSession(meeting.requirements, meeting_code=meeting.code)
+            self.dialogs[user_id] = session
+            text, keyboard = session.render()
+            self.edit_or_send(callback_id, user_id, text, keyboard)
+
         elif action == "edit":
             self.answer_safe(callback_id)
             self.begin_profile(user_id, meeting, "Обновим твои данные для этой встречи.")
@@ -290,6 +309,39 @@ class Bot:
             user_id, meeting,
             "Требования сохранены ✅ Теперь укажи, откуда поедешь ты.",
         )
+
+    def finish_requirements_edit(self, user_id, session, callback_id):
+        """Организатор сохранил изменённые требования готовой встречи."""
+        meeting = self.meetings.get(session.meeting_code)
+        self.dialogs.pop(user_id, None)
+
+        if meeting is None:
+            self.answer_safe(callback_id, text="Встреча уже закрыта.", attachments=[])
+            return
+
+        meeting.requirements = dict(session.requirements)
+        meeting.touch()
+
+        self.answer_safe(callback_id, text="Требования обновлены ✅", attachments=[])
+        self.reply(user_id, self.card_text(meeting), self.card_keyboard(meeting, user_id))
+
+        for uid in meeting.participants:
+            if uid != user_id:
+                self.reply(
+                    uid,
+                    "⚙️ Организатор изменил требования встречи:\n"
+                    + "\n".join(requirement_lines(meeting.requirements)),
+                    self.card_keyboard(meeting, uid),
+                )
+
+    def cancel_requirements_edit(self, user_id, session, callback_id):
+        meeting = self.meetings.get(session.meeting_code)
+        self.dialogs.pop(user_id, None)
+
+        self.answer_safe(callback_id, text="Изменения отменены.", attachments=[])
+
+        if meeting is not None:
+            self.reply(user_id, self.card_text(meeting), self.card_keyboard(meeting, user_id))
 
     def finish_profile(self, user_id, session, callback_id):
         meeting = self.meetings.get(session.meeting_code)
@@ -340,19 +392,14 @@ class Bot:
     # ------------------------------------------------------------ карточка встречи
 
     def card_text(self, meeting):
-        req = meeting.requirements
         lines = [f"👥 Встреча {meeting.code}", ""]
-
-        budget = req.get("budget_max")
-        if budget is not None:
-            lines.append("💰 Бюджет: " + ("без ограничений" if budget >= 1_000_000 else f"до {budget} ₽"))
-
-        lines.append(f"Участники ({len(meeting.participants)}/{MAX_PARTICIPANTS}):")
+        lines += requirement_lines(meeting.requirements)
+        lines += ["", f"Участники ({len(meeting.participants)}/{MAX_PARTICIPANTS}):"]
 
         for p in meeting.participants.values():
             role = " (организатор)" if p.user_id == meeting.organizer_id else ""
             lines.append(
-                f"• {p.name}{role} — {DISTRICT_NAMES.get(p.district, p.district)} · "
+                f"• {p.name}{role} — {district_name(p.district)} · "
                 f"{TRANSPORT_ICONS.get(p.transport, '')} · до {p.max_minutes} мин"
             )
 
@@ -363,6 +410,7 @@ class Bot:
 
         if viewer_id == meeting.organizer_id:
             rows.append([_btn("🔍 Найти место", f"m:find:{meeting.code}", "positive")])
+            rows.append([_btn("⚙️ Изменить требования", f"m:reqs:{meeting.code}")])
 
         rows.append([
             _btn("🔗 Пригласить", f"m:invite:{meeting.code}"),
@@ -405,40 +453,81 @@ class Bot:
         for uid in recipients:
             self.reply(uid, message, self.card_keyboard(meeting, uid))
 
+    def place_lines(self, meeting, number, result):
+        pl = result["place"]
+        lines = [
+            f"{number}. {pl['name']} — {category_name(pl['category'])}, "
+            f"{district_name(pl['district'])}",
+            f"   💰 {pl['price_min']}–{pl['price_max']} ₽ · ⭐ {pl['rating']} · "
+            f"🔊 {noise_name(pl['noise_level'])} · "
+            + ("🏠 в помещении" if pl["indoor"] else "🌤 на улице")
+            + (" · 🍴 есть еда" if pl["food_available"] else ""),
+        ]
+
+        if pl["interests"]:
+            lines.append(f"   🎯 {interest_names(pl['interests'])}")
+
+        way = []
+        for uid, minutes in result["times"].items():
+            p = meeting.participants[uid]
+            way.append(f"{p.name} {TRANSPORT_ICONS[p.transport]} {round(minutes)} мин")
+        lines.append("   🚦 " + "; ".join(way))
+
+        if result["warnings"]:
+            lines.append("   ⚠️ Не совпало: " + "; ".join(result["warnings"]))
+
+        lines.append("")
+        return lines
+
     def results_text(self, meeting, results, stats):
-        lines = [f"🎯 Лучшие места для встречи {meeting.code}",
-                 f"Подходит: {stats['found']} из {stats['total']}", ""]
+        lines = [f"🎯 Места для встречи {meeting.code}", ""]
+
+        if stats["perfect"]:
+            lines.append(f"✅ Полностью подходит мест: {stats['perfect']}")
+        else:
+            lines.append(
+                "Идеально подходящих мест нет, но вот те, что ближе всего "
+                "к вашим пожеланиям."
+            )
+
+        if stats["perfect"] and stats["relaxed"]:
+            lines.append("Ниже к ним добавлены варианты «почти подходят» (⚠️).")
+
+        lines.append("")
 
         for i, r in enumerate(results, start=1):
-            pl = r["place"]
-            lines.append(f"{i}. {pl['name']} — {pl['category']}, {pl['district']}")
-            lines.append(f"   💰 {pl['price_min']}–{pl['price_max']} ₽ · ⭐ {pl['rating']}")
+            lines += self.place_lines(meeting, i, r)
 
-            way = []
-            for uid, minutes in r["times"].items():
-                p = meeting.participants[uid]
-                way.append(f"{p.name} {TRANSPORT_ICONS[p.transport]} {round(minutes)} мин")
-            lines.append("   🚦 " + "; ".join(way))
-            lines.append("")
-
-        lines.append("Порядок: сначала те, где самая долгая дорога короче всего.")
+        lines.append(
+            "Порядок: сначала совпадающие полностью, затем те, где самая "
+            "долгая дорога короче."
+        )
         return "\n".join(lines)
 
     def no_results_text(self, stats):
-        if stats["after_filters"] == 0:
-            reason = ("Ни одно место не подошло по требованиям "
-                      "(бюджет, интересы, размер компании и т. д.).")
+        if stats["hard_excluded"] >= stats["total"]:
+            reason = (
+                "Ни одно место не вмещает вашу компанию, либо все места "
+                "попали в исключённые категории или сильно дороже бюджета."
+            )
         elif stats["too_far"] >= stats["unreachable"]:
-            reason = (f"По требованиям подошло {stats['after_filters']} мест, "
-                      "но всем они слишком далеко для чьего-то лимита времени в пути.")
+            reason = (
+                "Подходящие по требованиям места есть, но они слишком далеко "
+                "для чьего-то лимита времени в пути."
+            )
         else:
-            reason = (f"По требованиям подошло {stats['after_filters']} мест, "
-                      "но до них нельзя добраться выбранным транспортом "
-                      "(например, пешеходная зона для машины).")
+            reason = (
+                "Подходящие по требованиям места есть, но до них нельзя "
+                "добраться выбранным транспортом (например, пешеходная зона "
+                "для машины)."
+            )
 
-        return (f"Подходящих мест не нашлось 😔\n{reason}\n\n"
-                "Что можно ослабить: увеличить лимит времени в пути "
-                "(«✏️ Мои данные») или начать заново с другими требованиями (/start).")
+        return (
+            f"Подходящих мест не нашлось 😔\n{reason}\n\n"
+            "Что можно поменять: увеличить лимит времени в пути "
+            "(«✏️ Мои данные»), поднять бюджет или исключить меньше "
+            "категорий («⚙️ Изменить требования»)."
+        )
 
     # ------------------------------------------------------------ события
 
@@ -517,6 +606,7 @@ class Bot:
                  me.get("name"), me.get("user_id"), self.bot_username)
 
         marker = None
+        failures = 0
 
         while True:
             try:
@@ -526,13 +616,23 @@ class Bot:
                     types=["message_created", "message_callback", "bot_started"],
                 )
             except MaxApiError as error:
-                log.error("Ошибка long polling: %s", error)
-                time.sleep(3)
+                failures += 1
+
+                # сетевые сбои (обрыв прокси и т. п.) — одна строка без стека,
+                # и не чаще раза в 10 повторов, чтобы не засорять лог
+                if failures == 1 or failures % 10 == 0:
+                    log.warning("%s (повтор №%s)", error, failures)
+
+                time.sleep(min(3 * failures, 30))
                 continue
             except Exception as error:
                 log.exception("Неожиданная ошибка long polling: %s", error)
                 time.sleep(3)
                 continue
+
+            if failures:
+                log.info("Соединение восстановлено")
+                failures = 0
 
             for update in response.get("updates", []):
                 try:

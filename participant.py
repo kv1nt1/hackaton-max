@@ -10,24 +10,16 @@ STEP_MINUTES = "minutes"
 
 _ORDER = [STEP_DISTRICT, STEP_TRANSPORT, STEP_MINUTES]
 
-DISTRICTS = [
-    ("university", "🎓 Университет"),
-    ("downtown", "🏙 Центр"),
-    ("mall", "🛍 ТЦ"),
-    ("south", "🏘 Юг"),
-    ("park", "🌳 Парк"),
-    ("north", "🏡 Север"),
-]
+from dictionaries import DISTRICTS as _DISTRICTS
+from dictionaries import TRANSPORT as _TRANSPORT
 
-TRANSPORT = [
-    ("walk", "🚶 Пешком"),
-    ("car", "🚗 На машине"),
-]
+DISTRICTS = [(code, f"{emoji} {name}") for code, (emoji, name) in _DISTRICTS.items()]
+TRANSPORT = [(code, f"{emoji} {name}") for code, (emoji, name) in _TRANSPORT.items()]
 
 MINUTES_OPTIONS = [10, 15, 20, 30, 45, 60]
 
-DISTRICT_NAMES = {code: label.split(" ", 1)[1] for code, label in DISTRICTS}
-TRANSPORT_ICONS = {"walk": "🚶", "car": "🚗"}
+DISTRICT_NAMES = {code: name for code, (_, name) in _DISTRICTS.items()}
+TRANSPORT_ICONS = {code: emoji for code, (emoji, _) in _TRANSPORT.items()}
 
 _PROMPTS = {
     STEP_DISTRICT: "📍 В каком районе ты находишься? Отсюда бот посчитает дорогу до мест.",

@@ -76,7 +76,10 @@ class MaxApiError(RuntimeError):
     def __init__(self, status_code, payload):
         self.status_code = status_code
         self.payload = payload
-        super().__init__(f"MAX API error {status_code}: {payload}")
+        if status_code == 0:
+            super().__init__(f"Сетевая ошибка: {payload}")
+        else:
+            super().__init__(f"MAX API error {status_code}: {payload}")
 
 
 class MaxClient:
@@ -90,6 +93,11 @@ class MaxClient:
         self.base_url = (base_url or BASE_URL).rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+
+        # MAX_NO_PROXY=1 в .env — не использовать системный прокси
+        # (Windows / HTTP_PROXY / HTTPS_PROXY), ходить в MAX напрямую
+        if os.getenv("MAX_NO_PROXY", "").strip().lower() in ("1", "true", "yes"):
+            self.session.trust_env = False
         self.session.headers.update({"Authorization": self.token})
         self.session.mount("https://", _CAAdapter(_build_ssl_context()))
         self._last_sent_at = {}
@@ -97,13 +105,22 @@ class MaxClient:
     def _request(self, method, path, params=None, json_body=None, timeout=None):
         url = f"{self.base_url}{path}"
 
-        response = self.session.request(
-            method,
-            url,
-            params=params,
-            json=json_body,
-            timeout=timeout or self.timeout,
-        )
+        try:
+            response = self.session.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=timeout or self.timeout,
+            )
+        except requests.exceptions.ProxyError:
+            raise MaxApiError(0, "прокси оборвал соединение") from None
+        except requests.exceptions.Timeout:
+            raise MaxApiError(0, "таймаут запроса") from None
+        except requests.exceptions.SSLError as error:
+            raise MaxApiError(0, f"ошибка сертификата: {error}") from None
+        except requests.exceptions.RequestException as error:
+            raise MaxApiError(0, f"нет соединения: {type(error).__name__}") from None
 
         if response.status_code >= 400:
             try:
