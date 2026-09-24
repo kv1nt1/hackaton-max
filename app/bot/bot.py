@@ -7,36 +7,46 @@
 Переменные окружения (.env): MAX_BOT_TOKEN, DB_HOST, DB_PORT, DB_NAME,
 DB_USER, DB_PASSWORD.
 
-Сценарий:
-  1. Организатор пишет /start, отвечает на вопросы (бюджет, интересы, ...),
-     затем указывает свой район, транспорт и лимит времени в пути.
-  2. Бот создаёт встречу с кодом и ссылкой-приглашением.
-  3. Друзья переходят по ссылке (или пишут боту /join КОД), каждый
-     указывает свой район, транспорт и лимит времени в пути.
-  4. Организатор нажимает «Найти место»: бот фильтрует места по
-     требованиям, считает дорогу для КАЖДОГО участника по графу города и
-     присылает всем топ мест (справедливее — там, где максимум дороги
-     меньше).
+Два режима (выбираются в начале):
 
-Встречи хранятся в памяти (meetings.py) — при перезапуске бота теряются.
+  🏠 Комната. Организатор создаёт комнату и приглашает друзей. Каждый сам
+     указывает интересы, бюджет, район, транспорт и лимит времени в пути.
+     Организатор нажимает «Найти место»: бот считает, какие интересы
+     встречаются чаще всего, и подбирает места с учётом дороги каждого.
+
+  🎯 Самостоятельно. Пользователь сам выбирает общие требования, число
+     людей и вводит данные каждого участника по очереди. Без комнаты.
+
+Встречи хранятся в памяти (meetings.py) и теряются при перезапуске бота.
 """
 
 import logging
 import re
 import time
 
+from app.bot.dialog import (
+    ROOM_LEVEL_STEPS,
+    DialogSession,
+    default_room_requirements,
+    requirement_lines,
+)
+from app.bot.meetings import MAX_PARTICIPANTS, Meeting, MeetingStore, Participant
+from app.bot.participant import (
+    ROOM_STEPS,
+    SOLO_STEPS,
+    TRANSPORT_ICONS,
+    ProfileSession,
+)
+from app.core.recommend import interest_frequencies, rank_places
 from app.db import get_city_graph, get_places
-from app.bot.dialog import DialogSession, requirement_lines
 from app.dictionaries import (
     category_name,
     district_name,
+    interest_name,
     interest_names,
     noise_name,
 )
 from app.max_api.client import MaxApiError, MaxClient
-from app.bot.meetings import MAX_PARTICIPANTS, MeetingStore, Participant
-from app.bot.participant import TRANSPORT_ICONS, ProfileSession
-from app.core.recommend import rank_places
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +54,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("max-bot")
 
-RESTART_COMMANDS = {"/start", "начать", "заново", "/restart"}
+RESTART_COMMANDS = {"/start", "начать", "заново", "/restart", "/menu"}
 
 SESSION_IDLE_SECONDS = 24 * 3600      # диалоги без активности чистим через сутки
 CLEANUP_EVERY_SECONDS = 600
@@ -60,8 +70,9 @@ class Bot:
         self.client = client
         self.meetings = MeetingStore()
 
-        self.dialogs = {}        # user_id -> DialogSession (требования встречи)
+        self.dialogs = {}        # user_id -> DialogSession (общие требования)
         self.profiles = {}       # user_id -> ProfileSession (анкета участника)
+        self.solo = {}           # user_id -> состояние режима «самостоятельно»
         self.names = {}          # user_id -> имя
         self.last_seen = {}      # user_id -> время последней активности
 
@@ -97,23 +108,47 @@ class Bot:
     def name_of(self, user_id):
         return self.names.get(user_id) or f"Участник {str(user_id)[-4:]}"
 
-    # ------------------------------------------------------------ старт
-
-    def start_meeting_dialog(self, user_id):
-        """Организатор: сначала требования к встрече."""
+    def reset_user(self, user_id):
+        self.dialogs.pop(user_id, None)
         self.profiles.pop(user_id, None)
-        session = DialogSession()
-        self.dialogs[user_id] = session
+        self.solo.pop(user_id, None)
 
+    # ------------------------------------------------------------ главное меню
+
+    def show_home(self, user_id):
+        self.reset_user(user_id)
         self.reply(
             user_id,
-            "=== Подбор места для встречи ===\n\n"
-            "Сначала общие требования, потом пригласишь друзей — "
-            "каждый укажет, откуда поедет. Отвечай кнопками. "
-            "/start — начать заново.",
+            "Привет! Помогу выбрать место для встречи 🎉\n\n"
+            "🏠 Комната — приглашаешь друзей по ссылке, каждый сам указывает "
+            "интересы, бюджет и откуда поедет. Я найду место по самым "
+            "популярным интересам компании.\n\n"
+            "🎯 Самостоятельно — сам выбираешь интересы и вводишь данные "
+            "каждого участника, без комнаты.",
+            [
+                [_btn("🏠 Создать комнату", "home:room", "positive")],
+                [_btn("🎯 Выбрать самостоятельно", "home:solo")],
+            ],
         )
-        text, keyboard = session.render()
-        self.reply(user_id, text, keyboard)
+
+    def handle_home_callback(self, user_id, callback_id, payload):
+        if payload == "home:room":
+            self.answer_safe(callback_id, text="🏠 Режим: комната", attachments=[])
+            self.create_room(user_id)
+        elif payload == "home:solo":
+            self.answer_safe(callback_id, text="🎯 Режим: самостоятельно", attachments=[])
+            self.start_solo(user_id)
+
+    # ------------------------------------------------------------ комната
+
+    def create_room(self, user_id):
+        self.reset_user(user_id)
+        meeting = self.meetings.create(user_id, default_room_requirements())
+        self.begin_profile(
+            user_id, meeting,
+            "Комната создана 🏠 Сначала расскажи о себе — "
+            "остальные заполнят свои данные сами.",
+        )
 
     def start_join(self, user_id, code):
         meeting = self.meetings.get(code)
@@ -121,28 +156,125 @@ class Bot:
         if meeting is None:
             self.reply(
                 user_id,
-                "Встреча с таким кодом не найдена или уже закрыта 😕\n"
+                "Комната с таким кодом не найдена или уже закрыта 😕\n"
                 "Проверь код или попроси организатора прислать новый.",
             )
             return
 
         if user_id in meeting.participants:
-            self.reply(user_id, "Ты уже участвуешь в этой встрече 👍",
+            self.reply(user_id, "Ты уже в этой комнате 👍",
                        self.card_keyboard(meeting, user_id))
             return
 
         if self.meetings.is_full(meeting):
-            self.reply(user_id, f"В этой встрече уже максимум участников ({MAX_PARTICIPANTS}).")
+            self.reply(user_id, f"В комнате уже максимум участников ({MAX_PARTICIPANTS}).")
             return
 
-        self.dialogs.pop(user_id, None)
-        self.begin_profile(user_id, meeting, "Ты приглашён на встречу — осталось указать, откуда ты поедешь.")
+        self.reset_user(user_id)
+        self.begin_profile(
+            user_id, meeting,
+            "Тебя пригласили в комнату 🏠 Заполни свои данные — "
+            "бот учтёт их при подборе места.",
+        )
 
     def begin_profile(self, user_id, meeting, title):
-        session = ProfileSession(meeting.code)
+        session = ProfileSession(meeting.code, steps=ROOM_STEPS)
         self.profiles[user_id] = session
         text, keyboard = session.render(title)
         self.reply(user_id, text, keyboard)
+
+    # ------------------------------------------------------------ режим «самостоятельно»
+
+    def start_solo(self, user_id):
+        self.reset_user(user_id)
+        self.dialogs[user_id] = DialogSession()
+        self.solo[user_id] = {"stage": "reqs", "size": None, "people": []}
+
+        self.reply(
+            user_id,
+            "🎯 Подбор самостоятельно\n\n"
+            "Сначала общие требования, потом количество людей и данные "
+            "каждого участника. /start — вернуться в начало.",
+        )
+        text, keyboard = self.dialogs[user_id].render()
+        self.reply(user_id, text, keyboard)
+
+    def ask_group_size(self, user_id):
+        self.solo[user_id]["stage"] = "size"
+        sizes = list(range(2, MAX_PARTICIPANTS + 1))
+        rows = [
+            [_btn(str(n), f"solo:size:{n}") for n in sizes[i:i + 3]]
+            for i in range(0, len(sizes), 3)
+        ]
+        self.reply(
+            user_id,
+            "👥 Сколько человек в компании?\nВыбери кнопкой или напиши число.",
+            rows,
+        )
+
+    def set_group_size(self, user_id, size):
+        state = self.solo.get(user_id)
+        if state is None or not (1 <= size <= MAX_PARTICIPANTS):
+            self.reply(user_id, f"Нужно число от 1 до {MAX_PARTICIPANTS}.")
+            return
+
+        state["stage"] = "people"
+        state["size"] = size
+        state["people"] = []
+        self.begin_solo_person(user_id)
+
+    def begin_solo_person(self, user_id):
+        state = self.solo[user_id]
+        number = len(state["people"]) + 1
+        session = ProfileSession(
+            steps=SOLO_STEPS, solo_index=number, solo_total=state["size"]
+        )
+        self.profiles[user_id] = session
+        text, keyboard = session.render(f"👤 Участник {number} из {state['size']}")
+        self.reply(user_id, text, keyboard)
+
+    def finish_solo_person(self, user_id, session, callback_id):
+        state = self.solo.get(user_id)
+        if state is None:
+            return
+
+        self.profiles.pop(user_id, None)
+        number = session.solo_index
+        summary = f"👤 Участник {number}: {session.summary()}"
+
+        if callback_id:
+            self.answer_safe(callback_id, text=summary, attachments=[])
+        else:
+            self.reply(user_id, summary)
+
+        v = session.values
+        state["people"].append(Participant(
+            user_id=number, name=f"Участник {number}",
+            district=v["district"], transport=v["transport"],
+            max_minutes=v["minutes"],
+        ))
+
+        if len(state["people"]) < state["size"]:
+            self.begin_solo_person(user_id)
+        else:
+            self.run_solo_search(user_id)
+
+    def run_solo_search(self, user_id):
+        state = self.solo.get(user_id)
+        req = state["requirements"]
+
+        meeting = Meeting(
+            code="SOLO", organizer_id=user_id, requirements=req,
+            participants={p.user_id: p for p in state["people"]},
+        )
+
+        self.reply(user_id, "Ищу места и считаю дорогу…")
+        message = self.search_text(meeting, title="Подбор мест")
+
+        self.reply(user_id, message, [[
+            _btn("🔄 Искать заново", "home:solo", "positive"),
+            _btn("🏠 В начало", "restart"),
+        ]])
 
     # ------------------------------------------------------------ текст
 
@@ -152,16 +284,14 @@ class Bot:
         if not text:
             return
 
-        low = text.lower()
-
         # /join КОД  или  /start КОД (deep-link)
         m = re.match(r"^/(join|start)\s+([A-Za-z0-9_-]{4,32})$", text)
         if m:
             self.start_join(user_id, m.group(2))
             return
 
-        if low in RESTART_COMMANDS:
-            self.start_meeting_dialog(user_id)
+        if text.lower() in RESTART_COMMANDS:
+            self.show_home(user_id)
             return
 
         profile = self.profiles.get(user_id)
@@ -172,23 +302,34 @@ class Bot:
             elif profile.is_done():
                 self.finish_profile(user_id, profile, callback_id=None)
             else:
-                t, kb = profile.render("Анкета участника")
-                self.reply(user_id, t, kb)
+                self.reply(user_id, *profile.render(self.profile_title(profile)))
+            return
+
+        state = self.solo.get(user_id)
+        if state is not None and state["stage"] == "size":
+            if text.isdigit():
+                self.set_group_size(user_id, int(text))
+            else:
+                self.reply(user_id, "Выбери количество кнопкой или напиши число.")
             return
 
         dialog = self.dialogs.get(user_id)
-        if dialog is None or dialog.is_done():
-            self.start_meeting_dialog(user_id)
+        if dialog is not None:
+            ok, error = dialog.submit(text)
+            if not ok:
+                self.reply(user_id, error)
+            elif dialog.is_done():
+                self.finish_dialog(user_id, dialog, callback_id=None)
+            else:
+                self.reply(user_id, *dialog.render())
             return
 
-        ok, error = dialog.submit(text)
-        if not ok:
-            self.reply(user_id, error)
-        elif dialog.is_done():
-            self.finish_dialog(user_id, dialog, callback_id=None)
-        else:
-            t, kb = dialog.render()
-            self.reply(user_id, t, kb)
+        self.show_home(user_id)
+
+    def profile_title(self, session):
+        if session.solo:
+            return f"👤 Участник {session.solo_index} из {session.solo_total}"
+        return "Анкета участника"
 
     # ------------------------------------------------------------ кнопки
 
@@ -196,8 +337,15 @@ class Bot:
         payload = payload or ""
 
         if payload == "restart":
-            self.answer_safe(callback_id, attachments=[])
-            self.start_meeting_dialog(user_id)
+            self.answer_safe(callback_id, text="🔄 Начинаем заново", attachments=[])
+            self.show_home(user_id)
+        elif payload.startswith("home:"):
+            self.handle_home_callback(user_id, callback_id, payload)
+        elif payload.startswith("solo:size:"):
+            self.answer_safe(callback_id, text="Компания выбрана ✅", attachments=[])
+            value = payload.rsplit(":", 1)[1]
+            if value.isdigit():
+                self.set_group_size(user_id, int(value))
         elif payload.startswith("p:"):
             self.handle_profile_callback(user_id, callback_id, payload)
         elif payload.startswith("m:"):
@@ -210,7 +358,7 @@ class Bot:
 
         if session is None:
             self.answer_safe(callback_id, notification="Диалог устарел, начинаем заново")
-            self.start_meeting_dialog(user_id)
+            self.show_home(user_id)
             return
 
         status = session.press(payload)
@@ -231,7 +379,7 @@ class Bot:
         session = self.profiles.get(user_id)
 
         if session is None:
-            self.answer_safe(callback_id, notification="Анкета устарела. Открой приглашение заново.")
+            self.answer_safe(callback_id, notification="Анкета устарела. Открой /start.")
             return
 
         status = session.press(payload)
@@ -239,7 +387,7 @@ class Bot:
         if status == "stale":
             self.answer_safe(callback_id, notification="Эта кнопка уже неактуальна")
         elif status == "redraw":
-            text, keyboard = session.render("Анкета участника")
+            text, keyboard = session.render(self.profile_title(session))
             self.edit_or_send(callback_id, user_id, text, keyboard)
         elif status == "done":
             self.finish_profile(user_id, session, callback_id)
@@ -254,11 +402,11 @@ class Bot:
         meeting = self.meetings.get(code)
 
         if meeting is None:
-            self.answer_safe(callback_id, notification="Встреча уже закрыта")
+            self.answer_safe(callback_id, notification="Комната уже закрыта")
             return
 
         if user_id not in meeting.participants:
-            self.answer_safe(callback_id, notification="Ты не участник этой встречи")
+            self.answer_safe(callback_id, notification="Ты не участник этой комнаты")
             return
 
         meeting.touch()
@@ -268,29 +416,32 @@ class Bot:
                 self.answer_safe(callback_id, notification="Искать может только организатор")
                 return
             self.answer_safe(callback_id, notification="Ищу места, считаю дорогу…")
-            self.run_search(meeting)
+            self.run_room_search(meeting)
 
         elif action == "invite":
-            self.answer_safe(callback_id)
+            self.answer_safe(callback_id, notification="Отправил ссылку-приглашение")
             self.send_invite(user_id, meeting)
 
         elif action == "list":
-            self.answer_safe(callback_id, text=self.card_text(meeting),
-                             attachments=[self.client.inline_keyboard(
-                                 self.card_keyboard(meeting, user_id))])
+            self.answer_safe(
+                callback_id, text=self.card_text(meeting),
+                attachments=[self.client.inline_keyboard(self.card_keyboard(meeting, user_id))],
+            )
 
         elif action == "reqs":
             if user_id != meeting.organizer_id:
-                self.answer_safe(callback_id, notification="Менять требования может только организатор")
+                self.answer_safe(callback_id, notification="Менять общие условия может только организатор")
                 return
-            session = DialogSession(meeting.requirements, meeting_code=meeting.code)
+            session = DialogSession(
+                meeting.requirements, meeting_code=meeting.code, steps=ROOM_LEVEL_STEPS
+            )
             self.dialogs[user_id] = session
             text, keyboard = session.render()
             self.edit_or_send(callback_id, user_id, text, keyboard)
 
         elif action == "edit":
-            self.answer_safe(callback_id)
-            self.begin_profile(user_id, meeting, "Обновим твои данные для этой встречи.")
+            self.answer_safe(callback_id, notification="Открываю анкету")
+            self.begin_profile(user_id, meeting, "Обновим твои данные для этой комнаты.")
 
         else:
             self.answer_safe(callback_id, notification="Неизвестное действие")
@@ -298,38 +449,42 @@ class Bot:
     # ------------------------------------------------------------ завершение шагов
 
     def finish_dialog(self, user_id, session, callback_id):
-        """Требования собраны -> создаём встречу и просим анкету организатора."""
+        """Общие требования режима «самостоятельно» собраны -> спрашиваем размер компании."""
         if callback_id:
             self.answer_safe(callback_id, text=session.summary_text(), attachments=[])
+        else:
+            self.reply(user_id, session.summary_text())
 
-        meeting = self.meetings.create(user_id, session.requirements)
         self.dialogs.pop(user_id, None)
+        state = self.solo.get(user_id)
 
-        self.begin_profile(
-            user_id, meeting,
-            "Требования сохранены ✅ Теперь укажи, откуда поедешь ты.",
-        )
+        if state is None:
+            self.show_home(user_id)
+            return
+
+        state["requirements"] = dict(session.requirements)
+        self.ask_group_size(user_id)
 
     def finish_requirements_edit(self, user_id, session, callback_id):
-        """Организатор сохранил изменённые требования готовой встречи."""
+        """Организатор сохранил изменённые общие условия комнаты."""
         meeting = self.meetings.get(session.meeting_code)
         self.dialogs.pop(user_id, None)
 
         if meeting is None:
-            self.answer_safe(callback_id, text="Встреча уже закрыта.", attachments=[])
+            self.answer_safe(callback_id, text="Комната уже закрыта.", attachments=[])
             return
 
         meeting.requirements = dict(session.requirements)
         meeting.touch()
 
-        self.answer_safe(callback_id, text="Требования обновлены ✅", attachments=[])
+        self.answer_safe(callback_id, text="Общие условия обновлены ✅", attachments=[])
         self.reply(user_id, self.card_text(meeting), self.card_keyboard(meeting, user_id))
 
         for uid in meeting.participants:
             if uid != user_id:
                 self.reply(
                     uid,
-                    "⚙️ Организатор изменил требования встречи:\n"
+                    "⚙️ Организатор изменил общие условия комнаты:\n"
                     + "\n".join(requirement_lines(meeting.requirements)),
                     self.card_keyboard(meeting, uid),
                 )
@@ -344,16 +499,21 @@ class Bot:
             self.reply(user_id, self.card_text(meeting), self.card_keyboard(meeting, user_id))
 
     def finish_profile(self, user_id, session, callback_id):
+        if session.solo:
+            self.finish_solo_person(user_id, session, callback_id)
+            return
+
         meeting = self.meetings.get(session.meeting_code)
         self.profiles.pop(user_id, None)
 
+        summary = f"Твои данные: {session.summary()}"
         if callback_id:
-            self.answer_safe(callback_id, text=f"Твои данные: {session.summary()}", attachments=[])
+            self.answer_safe(callback_id, text=summary, attachments=[])
         else:
-            self.reply(user_id, f"Твои данные: {session.summary()}")
+            self.reply(user_id, summary)
 
         if meeting is None:
-            self.reply(user_id, "Встреча уже закрыта, начни новую: /start")
+            self.reply(user_id, "Комната уже закрыта, начни новую: /start")
             return
 
         v = session.values
@@ -361,15 +521,16 @@ class Bot:
         participant = Participant(
             user_id=user_id, name=self.name_of(user_id),
             district=v["district"], transport=v["transport"], max_minutes=v["minutes"],
+            interests=v.get("interests", []), budget=v.get("budget"),
         )
 
         if not self.meetings.upsert_participant(meeting, participant):
-            self.reply(user_id, f"Встреча уже заполнена (максимум {MAX_PARTICIPANTS}).")
+            self.reply(user_id, f"Комната уже заполнена (максимум {MAX_PARTICIPANTS}).")
             return
 
         if user_id == meeting.organizer_id:
             if not was_member:
-                self.reply(user_id, "Встреча создана 🎉")
+                self.reply(user_id, "Готово! Теперь пригласи друзей 🎉")
                 self.send_invite(user_id, meeting)
             self.reply(user_id, self.card_text(meeting), self.card_keyboard(meeting, user_id))
             return
@@ -377,7 +538,7 @@ class Bot:
         # приглашённый участник
         self.reply(
             user_id,
-            "Ты в встрече ✅ Организатор запустит поиск, и я пришлю результат сюда.",
+            "Ты в комнате ✅ Организатор запустит поиск, и я пришлю результат сюда.",
             self.card_keyboard(meeting, user_id),
         )
 
@@ -389,19 +550,31 @@ class Bot:
                 self.card_keyboard(meeting, meeting.organizer_id),
             )
 
-    # ------------------------------------------------------------ карточка встречи
+    # ------------------------------------------------------------ карточка комнаты
 
     def card_text(self, meeting):
-        lines = [f"👥 Встреча {meeting.code}", ""]
-        lines += requirement_lines(meeting.requirements)
-        lines += ["", f"Участники ({len(meeting.participants)}/{MAX_PARTICIPANTS}):"]
+        participants = list(meeting.participants.values())
+        lines = [f"🏠 Комната {meeting.code}", ""]
 
-        for p in meeting.participants.values():
+        lines.append("Общие условия:")
+        lines += requirement_lines(meeting.requirements)
+
+        freq = interest_frequencies(participants)
+        if freq:
+            top = ", ".join(f"{interest_name(t)} ({c})" for t, c in freq.most_common(5))
+            lines += ["", f"🔥 Популярные интересы: {top}"]
+
+        lines += ["", f"Участники ({len(participants)}/{MAX_PARTICIPANTS}):"]
+
+        for p in participants:
             role = " (организатор)" if p.user_id == meeting.organizer_id else ""
+            budget = "" if not p.budget or p.budget >= 1_000_000 else f" · до {p.budget} ₽"
             lines.append(
                 f"• {p.name}{role} — {district_name(p.district)} · "
-                f"{TRANSPORT_ICONS.get(p.transport, '')} · до {p.max_minutes} мин"
+                f"{TRANSPORT_ICONS.get(p.transport, '')} · до {p.max_minutes} мин{budget}"
             )
+            if p.interests:
+                lines.append(f"   🎯 {interest_names(p.interests)}")
 
         return "\n".join(lines)
 
@@ -410,7 +583,7 @@ class Bot:
 
         if viewer_id == meeting.organizer_id:
             rows.append([_btn("🔍 Найти место", f"m:find:{meeting.code}", "positive")])
-            rows.append([_btn("⚙️ Изменить требования", f"m:reqs:{meeting.code}")])
+            rows.append([_btn("⚙️ Общие условия", f"m:reqs:{meeting.code}")])
 
         rows.append([
             _btn("🔗 Пригласить", f"m:invite:{meeting.code}"),
@@ -431,30 +604,31 @@ class Bot:
 
     # ------------------------------------------------------------ поиск
 
-    def run_search(self, meeting):
-        organizer = meeting.organizer_id
-        recipients = list(meeting.participants)
+    def run_room_search(self, meeting):
+        message = self.search_text(meeting, title=f"Места для комнаты {meeting.code}")
 
+        for uid in list(meeting.participants):
+            self.reply(uid, message, self.card_keyboard(meeting, uid))
+
+    def search_text(self, meeting, title):
+        """Ищет места и возвращает готовый текст ответа."""
         try:
             places = get_places()
             graph = get_city_graph()
         except Exception as error:
             log.exception("Ошибка загрузки данных из БД")
-            self.reply(organizer, f"Не получилось получить данные из базы: {error}")
-            return
+            return f"Не получилось получить данные из базы: {error}"
 
         results, stats = rank_places(graph, places, meeting, top_n=TOP_N)
 
         if not results:
-            message = self.no_results_text(stats)
-        else:
-            message = self.results_text(meeting, results, stats)
+            return self.no_results_text(stats)
 
-        for uid in recipients:
-            self.reply(uid, message, self.card_keyboard(meeting, uid))
+        return self.results_text(meeting, results, stats, title)
 
     def place_lines(self, meeting, number, result):
         pl = result["place"]
+        total = len(meeting.participants)
         lines = [
             f"{number}. {pl['name']} — {category_name(pl['category'])}, "
             f"{district_name(pl['district'])}",
@@ -464,8 +638,13 @@ class Bot:
             + (" · 🍴 есть еда" if pl["food_available"] else ""),
         ]
 
-        if pl["interests"]:
-            lines.append(f"   🎯 {interest_names(pl['interests'])}")
+        if result["matched"]:
+            tags = ", ".join(
+                f"{interest_name(t)} ({c}/{total})" for t, c in result["matched"]
+            )
+            lines.append(f"   🎯 Совпало: {tags}")
+        elif pl["interests"]:
+            lines.append(f"   🎯 Интересы места: {interest_names(pl['interests'])}")
 
         way = []
         for uid, minutes in result["times"].items():
@@ -479,8 +658,13 @@ class Bot:
         lines.append("")
         return lines
 
-    def results_text(self, meeting, results, stats):
-        lines = [f"🎯 Места для встречи {meeting.code}", ""]
+    def results_text(self, meeting, results, stats, title):
+        lines = [f"🎯 {title}", ""]
+
+        if stats["top_tags"]:
+            n = stats["participants"]
+            top = ", ".join(f"{interest_name(t)} ({c} из {n})" for t, c in stats["top_tags"])
+            lines += [f"🔥 Популярные интересы компании: {top}", ""]
 
         if stats["perfect"]:
             lines.append(f"✅ Полностью подходит мест: {stats['perfect']}")
@@ -499,8 +683,8 @@ class Bot:
             lines += self.place_lines(meeting, i, r)
 
         lines.append(
-            "Порядок: сначала совпадающие полностью, затем те, где самая "
-            "долгая дорога короче."
+            "Порядок: сначала совпадающие полностью, затем те, где больше "
+            "популярных интересов и короче самая долгая дорога."
         )
         return "\n".join(lines)
 
@@ -512,21 +696,19 @@ class Bot:
             )
         elif stats["too_far"] >= stats["unreachable"]:
             reason = (
-                "Подходящие по требованиям места есть, но они слишком далеко "
+                "Подходящие места есть, но они слишком далеко "
                 "для чьего-то лимита времени в пути."
             )
         else:
             reason = (
-                "Подходящие по требованиям места есть, но до них нельзя "
-                "добраться выбранным транспортом (например, пешеходная зона "
-                "для машины)."
+                "Подходящие места есть, но до них нельзя добраться выбранным "
+                "транспортом (например, пешеходная зона для машины)."
             )
 
         return (
             f"Подходящих мест не нашлось 😔\n{reason}\n\n"
-            "Что можно поменять: увеличить лимит времени в пути "
-            "(«✏️ Мои данные»), поднять бюджет или исключить меньше "
-            "категорий («⚙️ Изменить требования»)."
+            "Что можно поменять: увеличить лимит времени в пути, поднять "
+            "бюджет или исключить меньше категорий."
         )
 
     # ------------------------------------------------------------ события
@@ -575,7 +757,7 @@ class Bot:
             if payload:
                 self.start_join(user_id, payload)   # пришёл по ссылке-приглашению
             else:
-                self.start_meeting_dialog(user_id)
+                self.show_home(user_id)
 
     # ------------------------------------------------------------ уборка
 
@@ -589,13 +771,12 @@ class Bot:
 
         idle = [u for u, t in self.last_seen.items() if now - t > SESSION_IDLE_SECONDS]
         for uid in idle:
-            self.dialogs.pop(uid, None)
-            self.profiles.pop(uid, None)
+            self.reset_user(uid)
             self.last_seen.pop(uid, None)
             self.names.pop(uid, None)
 
         if removed or idle:
-            log.info("Очистка: встреч %s, неактивных пользователей %s", removed, len(idle))
+            log.info("Очистка: комнат %s, неактивных пользователей %s", removed, len(idle))
 
     # ------------------------------------------------------------ polling
 

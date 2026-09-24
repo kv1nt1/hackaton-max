@@ -73,6 +73,20 @@ _PROMPTS = {
     STEP_NOISE: "🔊 Какой уровень шума допустим?",
 }
 
+# Общие условия комнаты (остальное каждый участник выбирает сам)
+ROOM_LEVEL_STEPS = [STEP_EXCLUDED, STEP_INDOOR, STEP_FOOD, STEP_NOISE]
+
+
+def default_room_requirements():
+    """Общие условия новой комнаты: пока ничего не ограничиваем."""
+    return {
+        "excluded_categories": [],
+        "indoor": None,
+        "food_required": False,
+        "max_noise_level": None,
+    }
+
+
 UNLIMITED_BUDGET = 1_000_000
 BUDGET_OPTIONS = [500, 1000, 1500, 2000, 3000, 5000]
 
@@ -204,7 +218,8 @@ def _chunk(buttons, size):
 class DialogSession:
     """Состояние диалога требований (создание или редактирование)."""
 
-    def __init__(self, requirements=None, meeting_code=None):
+    def __init__(self, requirements=None, meeting_code=None, steps=None):
+        self.order = list(steps or _STEP_ORDER)   # какие вопросы задаём
         self.step_index = 0
         self.requirements = {}
         self.answers = {}
@@ -219,14 +234,14 @@ class DialogSession:
     def _load(self, requirements):
         self.requirements = dict(requirements)
 
-        for step in _STEP_ORDER:
+        for step in self.order:
             key = _REQUIREMENT_KEYS[step]
             if key in self.requirements:
                 self.answers[step] = describe(step, self.requirements[key])
                 if step in self.selected:
                     self.selected[step] = list(self.requirements[key] or [])
 
-        self.step_index = len(_STEP_ORDER)
+        self.step_index = len(self.order)
         self.menu = True
 
     # ---- состояние
@@ -235,16 +250,16 @@ class DialogSession:
     def current_step(self):
         if self.editing:
             return self.editing
-        if self.step_index >= len(_STEP_ORDER):
+        if self.step_index >= len(self.order):
             return STEP_DONE
-        return _STEP_ORDER[self.step_index]
+        return self.order[self.step_index]
 
     def is_done(self):
         """Все вопросы созданной встречи пройдены (меню редактирования — нет)."""
         return (
             not self.menu
             and not self.editing
-            and self.step_index >= len(_STEP_ORDER)
+            and self.step_index >= len(self.order)
         )
 
     def _advance(self, step, value):
@@ -260,7 +275,7 @@ class DialogSession:
         if self.menu or self.step_index == 0:
             return False
         self.step_index -= 1
-        step = _STEP_ORDER[self.step_index]
+        step = self.order[self.step_index]
         self.requirements.pop(_REQUIREMENT_KEYS[step], None)
         self.answers.pop(step, None)
         return True
@@ -270,7 +285,7 @@ class DialogSession:
     def summary_lines(self):
         return [
             f"• {_STEP_TITLES[s]}: {self.answers[s]}"
-            for s in _STEP_ORDER
+            for s in self.order
             if s in self.answers
         ]
 
@@ -293,7 +308,7 @@ class DialogSession:
             if summary:
                 parts.append("Твои ответы:\n" + "\n".join(summary))
             parts.append(
-                f"Шаг {self.step_index + 1} из {len(_STEP_ORDER)}\n{_PROMPTS[step]}"
+                f"Шаг {self.step_index + 1} из {len(self.order)}\n{_PROMPTS[step]}"
             )
 
         return "\n\n".join(parts), self._keyboard(step)
@@ -305,7 +320,7 @@ class DialogSession:
         )
         rows = []
 
-        for step in _STEP_ORDER:
+        for step in self.order:
             label = f"{_STEP_ICONS[step]} {_STEP_TITLES[step]}: {self.answers.get(step, '—')}"
             if len(label) > 60:
                 label = label[:57] + "…"
@@ -403,7 +418,7 @@ class DialogSession:
 
         action = parts[1]
 
-        if action == "edit" and len(parts) == 3 and parts[2] in _STEP_ORDER:
+        if action == "edit" and len(parts) == 3 and parts[2] in self.order:
             self.editing = parts[2]
             return "redraw"
         if action == "done":
