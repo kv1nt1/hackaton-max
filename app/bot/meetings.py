@@ -24,6 +24,8 @@ class Participant:
     district: str
     transport: str        # "walk" | "car"
     max_minutes: int
+    interests: list = field(default_factory=list)   # коды интересов (пусто — без предпочтений)
+    budget: int = None                              # максимум на человека, ₽
 
 
 @dataclass
