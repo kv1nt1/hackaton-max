@@ -3,28 +3,17 @@
 
 Два варианта:
   * ROOM_STEPS — участник комнаты сам выбирает интересы, бюджет, район,
-    транспорт, лимит времени в пути, свободные дни и часы;
+    транспорт и лимит времени в пути;
   * SOLO_STEPS — режим «самостоятельно»: интересы и бюджет общие, для
-    каждого человека спрашиваем район, транспорт, лимит пути, свободные
-    дни и часы.
-
-Свободные дни — это то, из чего бот потом сам ищет общий день (когда
-свободны ВСЕ), а не наоборот: раньше дату спрашивали один раз в начале,
-как будто она уже известна, теперь каждый отмечает галочками, какие дни
-на неделе ему подходят, а совпадение считается на этапе поиска места
-(app/core/recommend.py).
+    каждого человека спрашиваем только район, транспорт и лимит пути.
 
 Формат payload:
     "p:<шаг>:pick:<значение>"     выбор варианта
     "p:interests:toggle:<код>"    отметить/снять интерес
     "p:interests:done:"           интересы выбраны
-    "p:free_days:toggle:<offset>" отметить/снять день (0..6 от сегодня)
-    "p:free_days:done:"           дни выбраны (нужен хотя бы один)
     "p:back:<шаг>"                назад
 """
 
-from datetime import date as date_cls
-from datetime import timedelta
 from datetime import time as time_cls
 
 from app.bot.dialog import BUDGET_OPTIONS, UNLIMITED_BUDGET
@@ -38,21 +27,17 @@ STEP_BUDGET = "budget"
 STEP_DISTRICT = "district"
 STEP_TRANSPORT = "transport"
 STEP_MINUTES = "minutes"
-STEP_FREE_DAYS = "free_days"
 STEP_AVAILABLE_FROM = "available_from"
 STEP_AVAILABLE_UNTIL = "available_until"
 
 ROOM_STEPS = [
     STEP_INTERESTS, STEP_BUDGET, STEP_DISTRICT, STEP_TRANSPORT, STEP_MINUTES,
-    STEP_FREE_DAYS, STEP_AVAILABLE_FROM, STEP_AVAILABLE_UNTIL,
+    STEP_AVAILABLE_FROM, STEP_AVAILABLE_UNTIL,
 ]
 SOLO_STEPS = [
     STEP_DISTRICT, STEP_TRANSPORT, STEP_MINUTES,
-    STEP_FREE_DAYS, STEP_AVAILABLE_FROM, STEP_AVAILABLE_UNTIL,
+    STEP_AVAILABLE_FROM, STEP_AVAILABLE_UNTIL,
 ]
-
-FREE_DAYS_HORIZON = 7   # на сколько дней вперёд можно отметить «я свободен»
-_WEEKDAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 # на выбор для «с какого часа свободен»; «до какого» показывает те же
 # отметки, но только позже уже выбранного начала
@@ -65,22 +50,6 @@ MINUTES_OPTIONS = [10, 15, 20, 30, 45, 60]
 
 DISTRICT_NAMES = {code: name for code, (_, name) in _DISTRICTS.items()}
 TRANSPORT_ICONS = {code: emoji for code, (emoji, _) in _TRANSPORT.items()}
-
-
-def day_label(day, today):
-    offset = (day - today).days
-    if offset == 0:
-        return "Сегодня"
-    if offset == 1:
-        return "Завтра"
-    return f"{_WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d.%m')}"
-
-
-def format_day(day):
-    """Дата для статичного вывода (карточка, результаты) — без «сегодня/завтра»,
-    чтобы не зависеть от момента, когда это читают."""
-    return f"{_WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d.%m')}"
-
 
 # формулировки: (от первого лица для комнаты, про другого человека для «самостоятельно»)
 _PROMPTS = {
@@ -106,20 +75,13 @@ _PROMPTS = {
         "⏱ Сколько минут в пути максимум?\nВыбери кнопкой или напиши число.",
         "⏱ Сколько минут в пути максимум для него?\nВыбери кнопкой или напиши число.",
     ),
-    STEP_FREE_DAYS: (
-        "🗓 В какие дни на этой неделе ты свободен? Отметь один или "
-        "несколько и нажми «Готово». Бот сам найдёт день, который "
-        "подойдёт всей компании.",
-        "🗓 В какие дни на этой неделе свободен этот человек? Отметь и "
-        "нажми «Готово».",
-    ),
     STEP_AVAILABLE_FROM: (
-        "🕐 С какого времени ты свободен в эти дни?",
-        "🕐 С какого времени он свободен в эти дни?",
+        "🕐 С какого времени ты свободен?",
+        "🕐 С какого времени свободен этот человек?",
     ),
     STEP_AVAILABLE_UNTIL: (
         "🕐 До какого времени ты свободен?",
-        "🕐 До какого времени он свободен?",
+        "🕐 До какого времени свободен этот человек?",
     ),
 }
 
@@ -138,13 +100,7 @@ class ProfileSession:
         self.solo_total = solo_total
         self.step_index = 0
         self.values = {}
-        self.selected_interests = []
-        self.selected_days = []           # выбранные offset'ы (0..FREE_DAYS_HORIZON-1)
-
-        # день-ноль фиксируем на момент создания анкеты, чтобы кнопки не
-        # «уехали» на другую дату, если человек отвечает уже за полночь
-        self.today = date_cls.today()
-        self.day_options = [self.today + timedelta(days=i) for i in range(FREE_DAYS_HORIZON)]
+        self.selected = []                # отмеченные интересы
 
     @property
     def solo(self):
@@ -171,13 +127,11 @@ class ProfileSession:
         if step == STEP_INTERESTS:
             btns = []
             for code, (emoji, name) in INTERESTS.items():
-                mark = "✅ " if code in self.selected_interests else f"{emoji} "
+                mark = "✅ " if code in self.selected else f"{emoji} "
                 btns.append(_button(f"{mark}{name}", f"p:{step}:toggle:{code}"))
             rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
-            if self.selected_interests:
-                rows.append([_button(
-                    f"Готово ({len(self.selected_interests)})", f"p:{step}:done:", "positive"
-                )])
+            if self.selected:
+                rows.append([_button(f"Готово ({len(self.selected)})", f"p:{step}:done:", "positive")])
             else:
                 rows.append([_button("Пропустить ➡️", f"p:{step}:done:")])
 
@@ -196,18 +150,6 @@ class ProfileSession:
         elif step == STEP_MINUTES:
             btns = [_button(f"{m} мин", f"p:{step}:pick:{m}") for m in MINUTES_OPTIONS]
             rows += [btns[i:i + 3] for i in range(0, len(btns), 3)]
-
-        elif step == STEP_FREE_DAYS:
-            btns = []
-            for offset, day in enumerate(self.day_options):
-                mark = "✅ " if offset in self.selected_days else "▫️ "
-                btns.append(_button(f"{mark}{day_label(day, self.today)}", f"p:{step}:toggle:{offset}"))
-            rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
-            if self.selected_days:
-                rows.append([_button(
-                    f"Готово ({len(self.selected_days)})", f"p:{step}:done:", "positive"
-                )])
-            # без выбранного дня «Готово» не показываем — день выбрать обязательно
 
         elif step == STEP_AVAILABLE_FROM:
             btns = [_button(t.strftime("%H:%M"), f"p:{step}:pick:{t.strftime('%H:%M')}")
@@ -239,10 +181,6 @@ class ProfileSession:
         parts.append(DISTRICT_NAMES[v[STEP_DISTRICT]])
         parts.append(TRANSPORT_ICONS[v[STEP_TRANSPORT]])
         parts.append(f"до {v[STEP_MINUTES]} мин")
-
-        if STEP_FREE_DAYS in v:
-            days = ", ".join(day_label(d, self.today) for d in v[STEP_FREE_DAYS])
-            parts.append(f"🗓 {days}")
 
         if STEP_AVAILABLE_FROM in v and STEP_AVAILABLE_UNTIL in v:
             parts.append(
@@ -276,27 +214,13 @@ class ProfileSession:
 
         if step == STEP_INTERESTS:
             if action == "toggle" and value in INTERESTS:
-                if value in self.selected_interests:
-                    self.selected_interests.remove(value)
+                if value in self.selected:
+                    self.selected.remove(value)
                 else:
-                    self.selected_interests.append(value)
+                    self.selected.append(value)
                 return "redraw"
             if action == "done":
-                self.values[step] = list(self.selected_interests)
-                self.step_index += 1
-                return "done" if self.is_done() else "redraw"
-            return "stale"
-
-        if step == STEP_FREE_DAYS:
-            if action == "toggle" and value.isdigit() and int(value) < len(self.day_options):
-                offset = int(value)
-                if offset in self.selected_days:
-                    self.selected_days.remove(offset)
-                else:
-                    self.selected_days.append(offset)
-                return "redraw"
-            if action == "done" and self.selected_days:
-                self.values[step] = [self.day_options[i] for i in sorted(self.selected_days)]
+                self.values[step] = list(self.selected)
                 self.step_index += 1
                 return "done" if self.is_done() else "redraw"
             return "stale"
@@ -351,8 +275,5 @@ class ProfileSession:
             if step == STEP_AVAILABLE_UNTIL:
                 return False, "Время должно быть позже начала и в формате ЧЧ:ММ, например 21:00."
             return False, "Напиши время в формате ЧЧ:ММ, например 18:00."
-
-        if step == STEP_FREE_DAYS:
-            return False, "Отметь дни кнопками под сообщением и нажми «Готово»."
 
         return False, "Выбери вариант кнопкой под сообщением."

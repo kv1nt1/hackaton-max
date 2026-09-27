@@ -12,27 +12,21 @@
      что реально объединяет компанию, — и ищем по ним.
   3. Routing для каждого участника (routing.py) — жёсткое отсечение,
      если до места не добраться выбранным транспортом.
-  4. День встречи не спрашивается заранее одним вопросом, а считается:
-     каждый участник отмечает у себя в анкете дни, когда он свободен
-     (галочками), а choose_meeting_day() ищет день, который отметили ВСЕ.
-     Если такого дня нет — берётся день, который отметило больше всего
-     людей, и это видно пользователю как предупреждение, а не тихо
-     подставляется.
-  5. Часы работы (hours.py): смотрим общее свободное окно компании
-     (пересечение личных часов участников) в выбранный день и считаем,
-     влезает ли туда визит средней длительности. Не влезает — штраф.
-  6. Существующие брони (bot_bookings): если на весь пересчитанный слот
+  4. Часы работы (hours.py): смотрим общее свободное окно компании
+     (пересечение окон участников) в выбранный день и считаем, влезает
+     ли туда визит средней длительности. Не влезает — штраф.
+  5. Существующие брони (bot_bookings): если на весь пересчитанный слот
      нет свободного времени — штраф «часто занято».
-  7. Остальные мягкие условия (indoor/food/noise/бюджет/дорога) —
+  6. Остальные мягкие условия (indoor/food/noise/бюджет/дорога) —
      штрафы, как раньше.
-  8. Сортировка: штраф -> интерес-балл (больше лучше) -> максимальное
+  7. Сортировка: штраф -> интерес-балл (больше лучше) -> максимальное
      время в пути (справедливость) -> среднее время -> рейтинг.
 
 Машинное обучение здесь не нужно: это подсчёт частот и взвешенная оценка.
 """
 
 from collections import Counter
-from datetime import date, datetime, time
+from datetime import datetime, time
 
 from app.core.filters import PENALTY_INTERESTS, evaluate_place
 from app.core.hours import find_free_start, is_open_at_all
@@ -75,35 +69,6 @@ def top_interests(freq, top_k=TOP_K_INTERESTS):
 
     ranked = sorted(pool.items(), key=lambda x: (-x[1], x[0]))
     return {t for t, _ in ranked[:top_k]}
-
-
-def choose_meeting_day(participants):
-    """
-    День встречи считается, а не спрашивается заранее: каждый участник
-    отмечает у себя в анкете, какие дни ему подходят, а здесь ищется
-    пересечение — день, когда свободны ВСЕ.
-
-    Возвращает (день, список всех общих дней по возрастанию, есть_ли_полное_совпадение).
-    Если общего дня нет, берётся день, который отметило больше всего
-    участников (компромисс), и has_full_overlap=False — это должно быть
-    видно пользователю как предупреждение, а не тихо подставляться.
-    """
-    day_sets = [set(p.free_days) for p in participants if p.free_days]
-
-    if day_sets:
-        common = sorted(set.intersection(*day_sets))
-        if common:
-            return common[0], common, True
-
-    counts = Counter(d for p in participants for d in p.free_days)
-    if not counts:
-        # никто не выбрал ни одного дня (не должно случаться — анкета
-        # требует хотя бы один) — используем сегодня как безопасный дефолт
-        return date.today(), [], False
-
-    best = max(counts.values())
-    fallback_days = sorted(d for d, c in counts.items() if c == best)
-    return fallback_days[0], fallback_days, False
 
 
 def common_availability_window(participants, meeting_date):
@@ -157,11 +122,8 @@ def rank_places(graph, places, meeting, top_n=5, bookings_by_place=None):
         requirements["budget_max"] = min(budgets)
     requirements.setdefault("budget_max", UNLIMITED_BUDGET)
 
-    meeting_date, common_days, has_common_day = choose_meeting_day(participants)
-    meeting.date = meeting_date   # запоминаем для карточки/брони
-
     window_start, window_end, has_common_window = common_availability_window(
-        participants, meeting_date
+        participants, meeting.date
     )
 
     stats = {
@@ -169,9 +131,7 @@ def rank_places(graph, places, meeting, top_n=5, bookings_by_place=None):
         "participants": n,
         "top_tags": sorted(((t, all_freq[t]) for t in focus), key=lambda x: -x[1]),
         "all_tags": all_freq.most_common(),
-        "date": meeting_date,
-        "common_days": common_days,
-        "has_common_day": has_common_day,
+        "date": meeting.date,
         "window": (window_start, window_end),
         "has_common_window": has_common_window,
         "hard_excluded": 0,
@@ -249,21 +209,17 @@ def rank_places(graph, places, meeting, top_n=5, bookings_by_place=None):
         duration = place.get("avg_duration_minutes") or 60
         opening_hours = place.get("opening_hours") or {}
 
-        if not is_open_at_all(opening_hours, meeting_date, window_start, window_end, duration):
+        if not is_open_at_all(opening_hours, meeting.date, window_start, window_end, duration):
             penalty += PENALTY_HOURS
             warnings.append("не работает в общее свободное время компании")
         else:
             busy = bookings_by_place.get(place["id"], [])
             suggested_start = find_free_start(
-                opening_hours, meeting_date, window_start, window_end, duration, busy=busy,
+                opening_hours, meeting.date, window_start, window_end, duration, busy=busy,
             )
             if suggested_start is None:
                 penalty += PENALTY_BOOKED
                 warnings.append("похоже, в это время уже занято другой компанией")
-
-        if not has_common_day:
-            penalty += PENALTY_HOURS
-            warnings.append("не у всех участников этот день отмечен как свободный")
 
         if not has_common_window:
             warnings.append("у участников нет общего свободного времени — уточните отдельно")

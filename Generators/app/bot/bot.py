@@ -23,7 +23,7 @@ DB_USER, DB_PASSWORD.
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import time as time_cls
 
 from app.bot.dialog import (
@@ -38,9 +38,8 @@ from app.bot.participant import (
     SOLO_STEPS,
     TRANSPORT_ICONS,
     ProfileSession,
-    format_day,
 )
-from app.core.recommend import choose_meeting_day, interest_frequencies, rank_places
+from app.core.recommend import interest_frequencies, rank_places
 from app.db import BookingsTableMissing, create_booking, get_bookings_for_places, get_city_graph, get_places
 from app.dictionaries import (
     category_name,
@@ -76,6 +75,7 @@ class Bot:
         self.dialogs = {}        # user_id -> DialogSession (общие требования)
         self.profiles = {}       # user_id -> ProfileSession (анкета участника)
         self.solo = {}           # user_id -> состояние режима «самостоятельно»
+        self.awaiting_date = {}  # user_id -> ("room", код) | ("solo", None)
         self.names = {}          # user_id -> имя
         self.last_seen = {}      # user_id -> время последней активности
 
@@ -115,6 +115,80 @@ class Bot:
         self.dialogs.pop(user_id, None)
         self.profiles.pop(user_id, None)
         self.solo.pop(user_id, None)
+        self.awaiting_date.pop(user_id, None)
+
+    # ------------------------------------------------------------ дата встречи
+
+    DATE_CHOICES_DAYS = 7   # на сколько дней вперёд можно выбрать дату
+
+    def ask_meeting_date(self, user_id, context, note=""):
+        self.awaiting_date[user_id] = context
+        today = date.today()
+        weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+        buttons = []
+        for offset in range(self.DATE_CHOICES_DAYS):
+            d = today + timedelta(days=offset)
+            if offset == 0:
+                label = "Сегодня"
+            elif offset == 1:
+                label = "Завтра"
+            else:
+                label = f"{weekdays[d.weekday()]} {d.strftime('%d.%m')}"
+            buttons.append(_btn(label, f"date:pick:{offset}"))
+
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+        self.reply(
+            user_id,
+            note + "📅 Когда встречаетесь?\n"
+            "Выбери кнопкой (на неделю вперёд) или напиши дату в формате ДД.ММ.",
+            rows,
+        )
+
+    @staticmethod
+    def parse_date_text(text):
+        """«ДД.ММ» (или «ДД.ММ.ГГГГ») -> ближайшая такая дата не в прошлом."""
+        text = text.strip()
+
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$", text)
+        if not m:
+            return None
+
+        day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
+        today = date.today()
+
+        try:
+            if year:
+                return date(int(year), month, day)
+            result = date(today.year, month, day)
+            return result if result >= today else date(today.year + 1, month, day)
+        except ValueError:
+            return None
+
+    def apply_meeting_date(self, user_id, chosen):
+        context, ref = self.awaiting_date.pop(user_id, (None, None))
+
+        if context == "room":
+            meeting = self.meetings.get(ref)
+            if meeting is None:
+                self.reply(user_id, "Комната уже закрыта, начни новую: /start")
+                return
+            meeting.date = chosen
+            self.begin_profile(
+                user_id, meeting,
+                f"Встречаемся {chosen.strftime('%d.%m')} 📅 Теперь расскажи о себе.",
+            )
+        elif context == "solo":
+            self.solo[user_id] = {"stage": "reqs", "date": chosen, "size": None, "people": []}
+            self.dialogs[user_id] = DialogSession()
+            self.reply(
+                user_id,
+                f"Встречаемся {chosen.strftime('%d.%m')} 📅\n"
+                "Теперь общие требования, потом количество людей и данные "
+                "каждого участника. /start — вернуться в начало.",
+            )
+            self.reply(user_id, *self.dialogs[user_id].render())
 
     # ------------------------------------------------------------ главное меню
 
@@ -147,11 +221,7 @@ class Bot:
     def create_room(self, user_id):
         self.reset_user(user_id)
         meeting = self.meetings.create(user_id, default_room_requirements())
-        self.begin_profile(
-            user_id, meeting,
-            "Комната создана 🏠 Сначала расскажи о себе — "
-            "остальные заполнят свои данные сами.",
-        )
+        self.ask_meeting_date(user_id, ("room", meeting.code), note="Комната создана 🏠\n\n")
 
     def start_join(self, user_id, code):
         meeting = self.meetings.get(code)
@@ -190,16 +260,7 @@ class Bot:
 
     def start_solo(self, user_id):
         self.reset_user(user_id)
-        self.dialogs[user_id] = DialogSession()
-        self.solo[user_id] = {"stage": "reqs", "size": None, "people": []}
-
-        self.reply(
-            user_id,
-            "🎯 Подбор самостоятельно\n\n"
-            "Сначала общие требования, потом количество людей и данные "
-            "каждого участника. /start — вернуться в начало.",
-        )
-        self.reply(user_id, *self.dialogs[user_id].render())
+        self.ask_meeting_date(user_id, ("solo", None), note="🎯 Подбор самостоятельно\n\n")
 
     def ask_group_size(self, user_id):
         self.solo[user_id]["stage"] = "size"
@@ -253,7 +314,7 @@ class Bot:
         state["people"].append(Participant(
             user_id=number, name=f"Участник {number}",
             district=v["district"], transport=v["transport"],
-            max_minutes=v["minutes"], free_days=v["free_days"],
+            max_minutes=v["minutes"],
             available_from=v["available_from"], available_until=v["available_until"],
         ))
 
@@ -269,6 +330,7 @@ class Bot:
         meeting = Meeting(
             code="SOLO", organizer_id=user_id, requirements=req,
             participants={p.user_id: p for p in state["people"]},
+            date=state["date"],
         )
         state["last_meeting"] = meeting
 
@@ -297,6 +359,14 @@ class Bot:
 
         if text.lower() in RESTART_COMMANDS:
             self.show_home(user_id)
+            return
+
+        if user_id in self.awaiting_date:
+            chosen = self.parse_date_text(text)
+            if chosen is None:
+                self.reply(user_id, "Не понял дату. Формат ДД.ММ, например 05.10, или кнопкой.")
+            else:
+                self.apply_meeting_date(user_id, chosen)
             return
 
         profile = self.profiles.get(user_id)
@@ -344,6 +414,17 @@ class Bot:
         if payload == "restart":
             self.answer_safe(callback_id, text="🔄 Начинаем заново", attachments=[])
             self.show_home(user_id)
+        elif payload.startswith("date:pick:"):
+            if user_id not in self.awaiting_date:
+                self.answer_safe(callback_id, notification="Эта кнопка уже неактуальна")
+                return
+            value = payload.rsplit(":", 1)[1]
+            if not value.isdigit() or not (0 <= int(value) < self.DATE_CHOICES_DAYS):
+                self.answer_safe(callback_id, notification="Эта кнопка уже неактуальна")
+                return
+            chosen = date.today() + timedelta(days=int(value))
+            self.answer_safe(callback_id, text=f"📅 Встречаемся {chosen.strftime('%d.%m')}", attachments=[])
+            self.apply_meeting_date(user_id, chosen)
         elif payload.startswith("home:"):
             self.handle_home_callback(user_id, callback_id, payload)
         elif payload.startswith("solo:size:"):
@@ -603,7 +684,6 @@ class Bot:
             user_id=user_id, name=self.name_of(user_id),
             district=v["district"], transport=v["transport"], max_minutes=v["minutes"],
             interests=v.get("interests", []), budget=v.get("budget"),
-            free_days=v["free_days"],
             available_from=v["available_from"], available_until=v["available_until"],
         )
 
@@ -647,14 +727,6 @@ class Bot:
             top = ", ".join(f"{interest_name(t)} ({c})" for t, c in freq.most_common(5))
             lines += ["", f"🔥 Популярные интересы: {top}"]
 
-        if participants:
-            _, common_days, has_common_day = choose_meeting_day(participants)
-            if has_common_day:
-                days = ", ".join(format_day(d) for d in common_days)
-                lines += ["", f"🗓 Общие свободные дни: {days}"]
-            else:
-                lines += ["", "🗓 Пока нет дня, свободного у всех участников."]
-
         lines += ["", f"Участники ({len(participants)}/{MAX_PARTICIPANTS}):"]
 
         for p in participants:
@@ -666,12 +738,6 @@ class Bot:
             )
             if p.interests:
                 lines.append(f"   🎯 {interest_names(p.interests)}")
-            if p.free_days:
-                days = ", ".join(format_day(d) for d in p.free_days)
-                lines.append(
-                    f"   🗓 {days} · {p.available_from.strftime('%H:%M')}–"
-                    f"{p.available_until.strftime('%H:%M')}"
-                )
 
         return "\n".join(lines)
 
@@ -792,19 +858,9 @@ class Bot:
         window_start, window_end = stats["window"]
         lines = [
             f"🎯 {title}",
-            f"📅 {format_day(stats['date'])}, "
+            f"📅 {stats['date'].strftime('%d.%m')}, "
             f"{window_start.strftime('%H:%M')}–{window_end.strftime('%H:%M')}",
         ]
-
-        if not stats["has_common_day"]:
-            lines.append(
-                "⚠️ Дня, свободного у всех, не нашлось — показан день, "
-                "который отметило больше всего участников. Возможно, "
-                "стоит договориться отдельно."
-            )
-        elif len(stats["common_days"]) > 1:
-            others = ", ".join(format_day(d) for d in stats["common_days"][1:])
-            lines.append(f"Кстати, все свободны ещё и в: {others}.")
 
         if not stats["has_common_window"]:
             lines.append(
@@ -859,13 +915,8 @@ class Bot:
             )
 
         note = ""
-        if not stats.get("has_common_day", True):
-            note += (
-                "\n\nКстати, дня, свободного у всех, тоже не нашлось — "
-                "возможно, стоит сначала договориться о дне."
-            )
         if not stats.get("has_common_window", True):
-            note += (
+            note = (
                 "\n\nКстати, у участников нет общего свободного времени — "
                 "возможно, стоит сначала договориться о часе встречи."
             )

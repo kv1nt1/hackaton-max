@@ -51,26 +51,21 @@ def last_to(bot, user):
 
 
 def fill_room_profile(bot, user, name, interests, budget, district, transport, minutes,
-                      free_days=(0,), available_from="18:00", available_until="23:00"):
-    """free_days — смещения от сегодня (0=сегодня, 1=завтра, ...)."""
+                      available_from="18:00", available_until="23:00"):
     for tag in interests:
         press(bot, user, f"p:interests:toggle:{tag}", name)
-    press(bot, user, "p:interests:done:", name)
-    press(bot, user, f"p:budget:pick:{budget}", name)
-    press(bot, user, f"p:district:pick:{district}", name)
-    press(bot, user, f"p:transport:pick:{transport}", name)
-    press(bot, user, f"p:minutes:pick:{minutes}", name)
-    for offset in free_days:
-        press(bot, user, f"p:free_days:toggle:{offset}", name)
-    press(bot, user, "p:free_days:done:", name)
-    press(bot, user, f"p:available_from:pick:{available_from}", name)
-    press(bot, user, f"p:available_until:pick:{available_until}", name)
+    for p in ["p:interests:done:", f"p:budget:pick:{budget}", f"p:district:pick:{district}",
+              f"p:transport:pick:{transport}", f"p:minutes:pick:{minutes}",
+              f"p:available_from:pick:{available_from}",
+              f"p:available_until:pick:{available_until}"]:
+        press(bot, user, p, name)
 
 
 def create_room(bot):
     say(bot, 1, "/start", "Аня")
     assert "Комната" in last_to(bot, 1)
     press(bot, 1, "home:room", "Аня")
+    press(bot, 1, "date:pick:0", "Аня")
     fill_room_profile(bot, 1, "Аня", ["coffee", "food"], 1500, "downtown", "car", 30)
     return list(bot.meetings._meetings)[0]
 
@@ -162,6 +157,7 @@ def test_room_budget_is_minimum_of_participants(bot):
 def test_solo_flow_without_room(bot):
     say(bot, 1, "/start", "Аня")
     press(bot, 1, "home:solo", "Аня")
+    press(bot, 1, "date:pick:1", "Аня")
     for p in ["budget:pick:1500", "interests:toggle:coffee", "interests:done:",
               "excluded_categories:done:", "indoor:pick:any", "food:pick:no", "noise:pick:any"]:
         press(bot, 1, p, "Аня")
@@ -171,12 +167,10 @@ def test_solo_flow_without_room(bot):
 
     assert "Участник 1 из 2" in last_to(bot, 1)
     for p in ["p:district:pick:downtown", "p:transport:pick:car", "p:minutes:pick:30",
-              "p:free_days:toggle:0", "p:free_days:done:",
               "p:available_from:pick:18:00", "p:available_until:pick:23:00"]:
         press(bot, 1, p, "Аня")
     assert "Участник 2 из 2" in last_to(bot, 1)
     for p in ["p:district:pick:south", "p:transport:pick:walk", "p:minutes:pick:60",
-              "p:free_days:toggle:0", "p:free_days:done:",
               "p:available_from:pick:17:00", "p:available_until:pick:21:00"]:
         press(bot, 1, p, "Аня")
 
@@ -189,6 +183,7 @@ def test_solo_flow_without_room(bot):
 def test_solo_group_size_by_text_and_validation(bot):
     say(bot, 1, "/start", "Аня")
     press(bot, 1, "home:solo", "Аня")
+    say(bot, 1, "10.10", "Аня")           # дата текстом (ДД.ММ)
     for p in ["budget:pick:1500", "interests:done:", "excluded_categories:done:",
               "indoor:pick:any", "food:pick:no", "noise:pick:any"]:
         press(bot, 1, p, "Аня")

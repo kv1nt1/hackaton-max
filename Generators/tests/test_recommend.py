@@ -1,5 +1,3 @@
-from datetime import date
-
 from app.bot.meetings import Meeting, Participant
 from app.core.recommend import interest_frequencies, rank_places, top_interests
 
@@ -26,10 +24,9 @@ def meeting_of(people, requirements=None):
                    participants={p.user_id: p for p in people})
 
 
-def person(uid, interests, budget=1500, district="downtown", free_days=None):
+def person(uid, interests, budget=1500, district="downtown"):
     return Participant(user_id=uid, name=f"P{uid}", district=district,
-                       transport="car", max_minutes=60, interests=interests, budget=budget,
-                       free_days=free_days if free_days is not None else [date.today()])
+                       transport="car", max_minutes=60, interests=interests, budget=budget)
 
 
 def test_frequency_counts_people_not_tags():
@@ -102,30 +99,3 @@ def test_slightly_over_budget_is_shown_with_warning(graph):
 
     assert len(results) == 1 and not results[0]["perfect"]
     assert any("бюджет" in w for w in results[0]["warnings"])
-
-
-def test_choose_meeting_day_intersection_and_fallback():
-    from datetime import date, timedelta
-
-    from app.core.recommend import choose_meeting_day
-
-    today = date.today()
-    mon, tue, wed = today, today + timedelta(1), today + timedelta(2)
-
-    # у всех троих общий день — вторник
-    people = [
-        person(1, [], free_days=[mon, tue]),
-        person(2, [], free_days=[tue, wed]),
-        person(3, [], free_days=[tue]),
-    ]
-    chosen, common, ok = choose_meeting_day(people)
-    assert chosen == tue and common == [tue] and ok is True
-
-    # общего дня нет — берём тот, что отметило больше всего людей (вторник: 2 из 3)
-    people2 = [
-        person(1, [], free_days=[mon]),
-        person(2, [], free_days=[tue]),
-        person(3, [], free_days=[tue]),
-    ]
-    chosen2, common2, ok2 = choose_meeting_day(people2)
-    assert chosen2 == tue and ok2 is False
