@@ -27,7 +27,6 @@ class Participant:
     max_minutes: int
     interests: list = field(default_factory=list)   # коды интересов (пусто — без предпочтений)
     budget: int = None                              # максимум на человека, ₽
-    free_days: list = field(default_factory=list)    # дни (date), когда человек свободен
     available_from: time_cls = time_cls(10, 0)       # когда человек свободен (это окно)
     available_until: time_cls = time_cls(23, 0)
 
@@ -38,7 +37,7 @@ class Meeting:
     organizer_id: int
     requirements: dict
     participants: dict = field(default_factory=dict)   # user_id -> Participant
-    date: date = field(default_factory=date.today)      # определяется при поиске (см. recommend.py)
+    date: date = field(default_factory=date.today)      # на какой день ищем место
     last_results: dict = field(default_factory=dict)    # place_id -> результат последнего поиска
     last_activity: float = field(default_factory=time.time)
 
