@@ -1,0 +1,64 @@
+name: meeting-bot
+
+services:
+  db:
+    image: postgres:17            # дамп сделан в PostgreSQL 17.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-postgres}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Укажите DB_PASSWORD в .env}
+    ports:
+      # наружу — только для localhost и на порт 5433, чтобы не конфликтовать
+      # с PostgreSQL, установленным на самой машине
+      - "127.0.0.1:${DB_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # скрипты из этой папки выполняются ТОЛЬКО при первом запуске (пустой volume)
+      - ./docker/db-init:/docker-entrypoint-initdb.d:ro
+      - ./data/DataBase.backup:/seed/DataBase.backup:ro
+      - ./sql/08_bot_bookings.sql:/seed/08_bot_bookings.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 обязателен: на время инициализации Postgres слушает только
+      # unix-сокет, и без -h контейнер стал бы "healthy" до окончания восстановления
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # внутри сети compose БД доступна по имени сервиса и порту 5432
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-postgres}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:?Укажите MAX_BOT_TOKEN в .env}
+      MAX_NO_PROXY: ${MAX_NO_PROXY:-}
+
+volumes:
+  pgdata:
+  pgadmin-data:
