@@ -1,0 +1,57 @@
+# Запуск (из папки Generators/):  docker compose up -d --build
+name: hackaton-max
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:?заполните DB_NAME в .env}
+      POSTGRES_USER: ${DB_USER:?заполните DB_USER в .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?заполните DB_PASSWORD в .env}
+    ports:
+      # наружу (для DBeaver/psql) только на localhost
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # инициализация выполняется один раз, при пустом томе pgdata
+      - ./docker/initdb/00-init-db.sh:/docker-entrypoint-initdb.d/00-init-db.sh:ro
+      - ./sql:/seed/sql:ro
+      - ./data:/seed/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # внутри сети compose база доступна по имени сервиса, порт всегда 5432
+      DB_HOST: db
+      DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:?заполните PGADMIN_PASSWORD в .env}
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "127.0.0.1:5050:80"
+    volumes:
+      - pgadmindata:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  pgadmindata:
