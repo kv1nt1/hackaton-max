@@ -1,0 +1,5 @@
+# Скрипты, которые выполняются в Linux-контейнере, должны быть с LF-окончаниями,
+# иначе на Windows (autocrlf) они ломаются с "bad interpreter".
+*.sh   text eol=lf
+*.yml  text eol=lf
+Dockerfile text eol=lf
